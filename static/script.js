@@ -10,14 +10,16 @@ function setLoading(isLoading) {
     const btnText = document.getElementById("btnText");
     const btnLoader = document.getElementById("btnLoader");
 
+    if (!sendBtn) return;
+
     sendBtn.disabled = isLoading;
 
     if (isLoading) {
-        btnText.classList.add("hidden");
-        btnLoader.classList.remove("hidden");
+        if (btnText) btnText.classList.add("hidden");
+        if (btnLoader) btnLoader.classList.remove("hidden");
     } else {
-        btnText.classList.remove("hidden");
-        btnLoader.classList.add("hidden");
+        if (btnText) btnText.classList.remove("hidden");
+        if (btnLoader) btnLoader.classList.add("hidden");
     }
 }
 
@@ -35,20 +37,171 @@ function hideError() {
     errorBox.textContent = "";
 }
 
-function showResult(answer, threadId) {
-    latestAnswerMarkdown = answer;
+function renderMarkdown(element, content) {
+    if (!element) return;
+
+    if (typeof marked !== "undefined") {
+        element.innerHTML = marked.parse(content || "");
+    } else {
+        element.innerText = content || "";
+    }
+}
+
+function showAgentStatus(selectedAgents = []) {
+    const agentStatus = document.getElementById("agentStatus");
+
+    if (!agentStatus) return;
+
+    const agentLabels = {
+        flight_agent: "✈ Flights",
+        hotel_agent: "⌂ Hotels",
+        weather_agent: "☁ Weather",
+        budget_agent: "₹ Budget",
+        itinerary_agent: "🗺 Itinerary"
+    };
+
+    agentStatus.innerHTML = "";
+
+    selectedAgents.forEach(agent => {
+        const badge = document.createElement("span");
+        badge.className = "agent-badge";
+        badge.textContent = agentLabels[agent] || agent;
+        agentStatus.appendChild(badge);
+    });
+
+    if (selectedAgents.length > 0) {
+        agentStatus.classList.remove("hidden");
+    } else {
+        agentStatus.classList.add("hidden");
+    }
+}
+
+function showTripConstraints(constraints = {}) {
+    const constraintsBox = document.getElementById("tripConstraints");
+
+    if (!constraintsBox) return;
+
+    constraintsBox.innerHTML = "";
+
+    const fields = [
+        ["destination", "Destination"],
+        ["origin", "Origin"],
+        ["duration", "Duration"],
+        ["budget", "Budget"],
+        ["travel_style", "Travel Style"]
+    ];
+
+    fields.forEach(([key, label]) => {
+        const value = constraints[key];
+
+        if (!value) return;
+
+        const item = document.createElement("div");
+        item.className = "constraint-item";
+
+        item.innerHTML = `
+            <span class="constraint-label">${label}</span>
+            <span class="constraint-value">${value}</span>
+        `;
+
+        constraintsBox.appendChild(item);
+    });
+
+    if (Array.isArray(constraints.special_preferences)) {
+        constraints.special_preferences.forEach(preference => {
+            if (!preference) return;
+
+            const item = document.createElement("div");
+            item.className = "constraint-item";
+
+            item.innerHTML = `
+                <span class="constraint-label">Preference</span>
+                <span class="constraint-value">${preference}</span>
+            `;
+
+            constraintsBox.appendChild(item);
+        });
+    }
+
+    if (constraintsBox.children.length > 0) {
+        constraintsBox.classList.remove("hidden");
+    } else {
+        constraintsBox.classList.add("hidden");
+    }
+}
+
+function showApprovalPanel(data) {
+    const approvalPanel = document.getElementById("approvalPanel");
+    const approvalRequest = document.getElementById("approvalRequest");
+    const feedbackInput = document.getElementById("feedbackInput");
+
+    if (!approvalPanel) return;
+
+    if (approvalRequest) {
+        approvalRequest.textContent =
+            data.approval_request ||
+            "Please review the generated itinerary before finalizing.";
+    }
+
+    if (feedbackInput) {
+        feedbackInput.value = "";
+    }
+
+    approvalPanel.classList.remove("hidden");
+
+    approvalPanel.scrollIntoView({
+        behavior: "smooth",
+        block: "center"
+    });
+}
+
+function hideApprovalPanel() {
+    const approvalPanel = document.getElementById("approvalPanel");
+
+    if (approvalPanel) {
+        approvalPanel.classList.add("hidden");
+    }
+}
+
+function updateApprovalStatus(approved) {
+    const approvalStatus = document.getElementById("approvalStatus");
+
+    if (!approvalStatus) return;
+
+    if (approved) {
+        approvalStatus.textContent = "✓ Plan approved";
+        approvalStatus.classList.remove("hidden");
+    } else {
+        approvalStatus.textContent = "↻ Revision requested";
+        approvalStatus.classList.remove("hidden");
+    }
+}
+
+function showResult(data) {
+    latestAnswerMarkdown = data.answer || "";
 
     const resultSection = document.getElementById("resultSection");
     const resultBox = document.getElementById("resultBox");
     const threadInfo = document.getElementById("threadInfo");
 
-    if (typeof marked !== "undefined") {
-        resultBox.innerHTML = marked.parse(answer);
-    } else {
-        resultBox.innerText = answer;
+    renderMarkdown(resultBox, data.answer || "");
+
+    if (threadInfo) {
+        threadInfo.textContent = `Thread ID: ${data.thread_id}`;
     }
 
-    threadInfo.textContent = `Thread ID: ${threadId}`;
+    showAgentStatus(data.selected_agents || []);
+    showTripConstraints(data.trip_constraints || []);
+
+    if (data.requires_approval) {
+        showApprovalPanel(data);
+    } else {
+        hideApprovalPanel();
+
+        if (data.approved !== null && data.approved !== undefined) {
+            updateApprovalStatus(data.approved);
+        }
+    }
 
     resultSection.classList.remove("hidden");
 
@@ -70,6 +223,7 @@ async function sendMessage() {
     }
 
     setLoading(true);
+    hideApprovalPanel();
 
     try {
         const response = await fetch("/api/travel", {
@@ -86,19 +240,112 @@ async function sendMessage() {
         const data = await response.json();
 
         if (!response.ok || !data.success) {
-            throw new Error(data.error || "Something went wrong.");
+            throw new Error(
+                data.error || "Something went wrong."
+            );
         }
 
         currentThreadId = data.thread_id;
-        localStorage.setItem("travel_thread_id", currentThreadId);
 
-        showResult(data.answer, data.thread_id);
+        localStorage.setItem(
+            "travel_thread_id",
+            currentThreadId
+        );
+
+        showResult(data);
 
     } catch (error) {
         showError(error.message);
     } finally {
         setLoading(false);
     }
+}
+
+async function submitApproval(approved) {
+    hideError();
+
+    if (!currentThreadId) {
+        showError("No active travel planning session found.");
+        return;
+    }
+
+    const feedbackInput =
+        document.getElementById("feedbackInput");
+
+    const feedback =
+        feedbackInput?.value.trim() || "";
+
+    const approveBtn =
+        document.getElementById("approveBtn");
+
+    const reviseBtn =
+        document.getElementById("reviseBtn");
+
+    if (approveBtn) approveBtn.disabled = true;
+    if (reviseBtn) reviseBtn.disabled = true;
+
+    try {
+        const response = await fetch(
+            "/api/travel/resume",
+            {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                    thread_id: currentThreadId,
+                    approved: approved,
+                    feedback: feedback
+                })
+            }
+        );
+
+        const data = await response.json();
+
+        if (!response.ok || !data.success) {
+            throw new Error(
+                data.error ||
+                "Could not resume the travel planning workflow."
+            );
+        }
+
+        currentThreadId = data.thread_id;
+
+        localStorage.setItem(
+            "travel_thread_id",
+            currentThreadId
+        );
+
+        showResult(data);
+
+        if (!data.requires_approval) {
+            updateApprovalStatus(approved);
+        }
+
+    } catch (error) {
+        showError(error.message);
+    } finally {
+        if (approveBtn) approveBtn.disabled = false;
+        if (reviseBtn) reviseBtn.disabled = false;
+    }
+}
+
+function approvePlan() {
+    submitApproval(true);
+}
+
+function requestRevision() {
+    const feedbackInput =
+        document.getElementById("feedbackInput");
+
+    if (!feedbackInput?.value.trim()) {
+        showError(
+            "Please provide feedback before requesting a revision."
+        );
+        return;
+    }
+
+    submitApproval(false);
 }
 
 function copyResult() {
@@ -111,7 +358,11 @@ function copyResult() {
 
     navigator.clipboard.writeText(text)
         .then(() => {
-            const copyBtn = document.querySelector(".copy-btn");
+            const copyBtn =
+                document.querySelector(".copy-btn");
+
+            if (!copyBtn) return;
+
             const oldText = copyBtn.textContent;
 
             copyBtn.textContent = "Copied!";
@@ -126,22 +377,31 @@ function copyResult() {
 }
 
 function downloadPDF() {
-    const pdfContent = document.getElementById("pdfContent");
+    const pdfContent =
+        document.getElementById("pdfContent");
 
     if (!latestAnswerMarkdown || !pdfContent) {
-        showError("No travel plan available to download.");
+        showError(
+            "No travel plan available to download."
+        );
         return;
     }
 
-    const downloadBtn = document.querySelector(".download-btn");
+    const downloadBtn =
+        document.querySelector(".download-btn");
+
+    if (!downloadBtn) return;
+
     const oldText = downloadBtn.textContent;
 
-    downloadBtn.textContent = "Preparing PDF...";
+    downloadBtn.textContent =
+        "Preparing PDF...";
+
     downloadBtn.disabled = true;
 
     const options = {
         margin: 0.5,
-        filename: "ai-travel-plan.pdf",
+        filename: "voyanta-travel-plan.pdf",
         image: {
             type: "jpeg",
             quality: 0.98
@@ -157,7 +417,11 @@ function downloadPDF() {
             orientation: "portrait"
         },
         pagebreak: {
-            mode: ["avoid-all", "css", "legacy"]
+            mode: [
+                "avoid-all",
+                "css",
+                "legacy"
+            ]
         }
     };
 
@@ -176,8 +440,14 @@ function downloadPDF() {
         });
 }
 
-document.addEventListener("keydown", function(event) {
-    if (event.ctrlKey && event.key === "Enter") {
-        sendMessage();
+document.addEventListener(
+    "keydown",
+    function(event) {
+        if (
+            event.ctrlKey &&
+            event.key === "Enter"
+        ) {
+            sendMessage();
+        }
     }
-});
+);

@@ -410,6 +410,10 @@ def hotel_agent(state: TravelState):
         ),
     }
 
+
+
+
+
 def weather_agent(state: TravelState):
     city = extract_destination(
         state["user_query"]

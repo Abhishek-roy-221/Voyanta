@@ -3,239 +3,341 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-
     <meta name="description" content="Voyanta — AI-powered multi-agent travel planner">
+
     <title>Voyanta — AI Travel Planner</title>
 
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@600;700;800&display=swap" rel="stylesheet">
+
+    <link
+        href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@600;700;800&display=swap"
+        rel="stylesheet"
+    >
 
     <link rel="stylesheet" href="/static/style.css">
 </head>
 
 <body>
 
-    <div class="page-bg" aria-hidden="true">
-        <div class="orb orb-1"></div>
-        <div class="orb orb-2"></div>
-        <div class="orb orb-3"></div>
-        <div class="grid-overlay"></div>
-    </div>
+<div class="page-bg" aria-hidden="true">
+    <div class="orb orb-1"></div>
+    <div class="orb orb-2"></div>
+    <div class="orb orb-3"></div>
+    <div class="grid-overlay"></div>
+</div>
 
-    <main class="app-container">
+<main class="app-container">
 
-        <header class="site-header">
-            <a href="/" class="brand">
-                <span class="brand-mark">✦</span>
-                <span>Voyanta</span>
-            </a>
+    <header class="site-header">
 
-            <div class="header-meta">
-                <span class="live-indicator">
-                    <span class="status-dot"></span>
-                    AI Travel Agent
+        <a href="/" class="brand">
+            <span class="brand-mark">✦</span>
+            <span>Voyanta</span>
+        </a>
+
+        <div class="header-meta">
+            <span class="live-indicator">
+                <span class="status-dot"></span>
+                AI Travel Agent
+            </span>
+        </div>
+
+    </header>
+
+
+    <section class="hero-section">
+
+        <div class="badge">
+            <span class="badge-icon">✈</span>
+            Multi-Agent Travel Planning
+            <span class="badge-separator">•</span>
+            <span>LangGraph</span>
+        </div>
+
+        <h1>
+            Plan the trip.<br>
+            <span class="gradient-text">
+                We'll handle the details.
+            </span>
+        </h1>
+
+        <p class="hero-copy">
+            Tell Voyanta where you want to go, your budget, and what you want
+            to experience. Our AI agents research flights, hotels, weather,
+            budgets, and build your itinerary.
+        </p>
+
+        <div class="hero-features">
+
+            <span>
+                <span class="feature-icon">✈</span>
+                Flight research
+            </span>
+
+            <span>
+                <span class="feature-icon">⌂</span>
+                Hotel discovery
+            </span>
+
+            <span>
+                <span class="feature-icon">☁</span>
+                Weather analysis
+            </span>
+
+            <span>
+                <span class="feature-icon">₹</span>
+                Budget analysis
+            </span>
+
+            <span>
+                <span class="feature-icon">✦</span>
+                Smart itinerary
+            </span>
+
+        </div>
+
+    </section>
+
+
+    <section class="planner-card">
+
+        <div class="card-glow"></div>
+
+        <div class="card-header">
+
+            <div>
+
+                <span class="eyebrow">
+                    START PLANNING
                 </span>
+
+                <h2>
+                    Where are you going?
+                </h2>
+
+                <p>
+                    Describe your ideal trip naturally.
+                    Voyanta will figure out the details.
+                </p>
+
             </div>
-        </header>
 
-
-        <section class="hero-section">
-
-            <div class="badge">
-                <span class="badge-icon">✈</span>
-                Multi-Agent Travel Planning
-                <span class="badge-separator">•</span>
-                <span>LangGraph</span>
+            <div class="status-pill">
+                <span class="status-dot"></span>
+                Ready
             </div>
 
-            <h1>
-                Plan the trip.<br>
-                <span class="gradient-text">We'll handle the details.</span>
-            </h1>
-
-            <p class="hero-copy">
-                Tell Voyanta where you want to go, your budget, and what you want
-                to experience. Our AI agents research flights, hotels, and
-                activities to build your itinerary.
-            </p>
-
-            <div class="hero-features">
-                <span>
-                    <span class="feature-icon">⌁</span>
-                    Flight research
-                </span>
-
-                <span>
-                    <span class="feature-icon">⌂</span>
-                    Hotel discovery
-                </span>
-
-                <span>
-                    <span class="feature-icon">✦</span>
-                    Smart itinerary
-                </span>
-            </div>
-
-        </section>
+        </div>
 
 
-        <section class="planner-card">
+        <div class="input-area">
 
-            <div class="card-glow"></div>
+            <div class="textarea-wrap">
 
-            <div class="card-header">
+                <textarea
+                    id="userInput"
+                    rows="5"
+                    placeholder="e.g. Plan a 7-day Japan trip from Kolkata under ₹2 lakh, including flights, hotels and sightseeing..."
+                    aria-label="Describe your travel request"
+                ></textarea>
 
-                <div>
-                    <span class="eyebrow">START PLANNING</span>
-
-                    <h2>Where are you going?</h2>
-
-                    <p>
-                        Describe your ideal trip naturally.
-                        Voyanta will figure out the details.
-                    </p>
+                <div class="input-hint">
+                    <span>✦</span>
+                    Try mentioning destination, duration, origin and budget
                 </div>
 
-                <div class="status-pill">
-                    <span class="status-dot"></span>
-                    Ready
-                </div>
-
             </div>
 
 
-            <div class="input-area">
+            <button
+                id="sendBtn"
+                class="generate-btn"
+                onclick="sendMessage()"
+            >
 
-                <div class="textarea-wrap">
+                <span id="btnText">
+                    Generate my trip
+                </span>
 
-                    <textarea
-                        id="userInput"
-                        rows="5"
-                        placeholder="e.g. Plan a 7-day Japan trip from Kolkata under ₹2 lakh, including flights, hotels and sightseeing..."
-                        aria-label="Describe your travel request"
-                    ></textarea>
+                <span class="btn-arrow">
+                    →
+                </span>
 
-                    <div class="input-hint">
-                        <span>✦</span>
-                        Try mentioning destination, duration, origin and budget
-                    </div>
+                <span
+                    id="btnLoader"
+                    class="loader hidden"
+                ></span>
 
-                </div>
+            </button>
 
+        </div>
+
+
+        <div class="quick-section">
+
+            <span class="quick-label">
+                TRY AN EXAMPLE
+            </span>
+
+            <div class="quick-prompts">
 
                 <button
-                    id="sendBtn"
-                    class="generate-btn"
-                    onclick="sendMessage()"
+                    type="button"
+                    onclick="setPrompt('Plan a complete 7 days Japan trip from Kolkata including flights, hotels and sightseeing under ₹2 lakhs.')"
                 >
+                    <span>🇯🇵</span>
+                    Japan
+                </button>
 
-                    <span id="btnText">
-                        Generate my trip
-                    </span>
+                <button
+                    type="button"
+                    onclick="setPrompt('Plan a 5 days Dubai trip from Delhi with flights, hotels and sightseeing.')"
+                >
+                    <span>🇦🇪</span>
+                    Dubai
+                </button>
 
-                    <span class="btn-arrow">
-                        →
-                    </span>
+                <button
+                    type="button"
+                    onclick="setPrompt('Plan a 7 days Thailand trip from Delhi with budget hotels and sightseeing.')"
+                >
+                    <span>🇹🇭</span>
+                    Thailand
+                </button>
 
-                    <span
-                        id="btnLoader"
-                        class="loader hidden"
-                    ></span>
-
+                <button
+                    type="button"
+                    onclick="setPrompt('Give me all country flight info.')"
+                >
+                    <span>✈</span>
+                    Live flights
                 </button>
 
             </div>
 
+        </div>
 
-            <div class="quick-section">
+    </section>
 
-                <span class="quick-label">
-                    TRY AN EXAMPLE
+
+    <section
+        id="resultSection"
+        class="result-section hidden"
+    >
+
+        <div class="result-header">
+
+            <div>
+
+                <span class="eyebrow">
+                    YOUR PERSONALIZED PLAN
                 </span>
 
-                <div class="quick-prompts">
+                <h2>
+                    Your AI Travel Plan
+                </h2>
 
-    <button
-        type="button"
-        onclick="setPrompt('Plan a complete 7 days Japan trip from Bangladesh including flights, hotels and sightseeing under 2 lakhs.')"
-    >
-        <span>🇯🇵</span>
-        Japan
-    </button>
+                <p id="threadInfo">
+                    Thread ID: -
+                </p>
 
-    <button
-        type="button"
-        onclick="setPrompt('Plan a 5 days Japan trip from Delhi with flights, hotels and sightseeing.')"
-    >
-        <span>🇦🇪</span>
-        Dubai
-    </button>
-
-    <button
-        type="button"
-        onclick="setPrompt('Plan a 7 days Thailand trip from Delhi with budget hotels and sightseeing.')"
-    >
-        <span>🇹🇭</span>
-        Thailand
-    </button>
-
-    <button
-        type="button"
-        onclick="setPrompt('Give me all country flight info.')"
-    >
-        <span>✈</span>
-        Live flights
-    </button>
-
-</div>
             </div>
 
-        </section>
+
+            <div class="result-actions">
+
+                <button
+                    class="secondary-btn copy-btn"
+                    onclick="copyResult()"
+                >
+                    <span>⧉</span>
+                    Copy
+                </button>
+
+                <button
+                    class="primary-small-btn download-btn"
+                    onclick="downloadPDF()"
+                >
+                    <span>↓</span>
+                    Download PDF
+                </button>
+
+            </div>
+
+        </div>
 
 
-        <section
-            id="resultSection"
-            class="result-section hidden"
-        >
+        <!-- AGENT WORKFLOW -->
 
-            <div class="result-header">
+        <div class="agent-overview">
+
+            <div class="overview-heading">
+
+                <span class="overview-icon">
+                    ⚙
+                </span>
 
                 <div>
 
-                    <span class="eyebrow">
-                        YOUR PERSONALIZED PLAN
+                    <strong>
+                        Agent Workflow
+                    </strong>
+
+                    <span>
+                        Voyanta selected these specialists for your request
                     </span>
-
-                    <h2>
-                        Your AI Travel Plan
-                    </h2>
-
-                    <p id="threadInfo">
-                        Thread ID: -
-                    </p>
 
                 </div>
 
+            </div>
 
-                <div class="result-actions">
+            <div
+                id="agentStatus"
+                class="agent-status hidden"
+            ></div>
 
-                    <button
-                        class="secondary-btn copy-btn"
-                        onclick="copyResult()"
-                    >
-                        <span>⧉</span>
-                        Copy
-                    </button>
+        </div>
 
 
-                    <button
-                        class="primary-small-btn download-btn"
-                        onclick="downloadPDF()"
-                    >
-                        <span>↓</span>
-                        Download PDF
-                    </button>
+        <!-- TRIP CONSTRAINTS -->
+
+        <div
+            id="tripConstraints"
+            class="trip-constraints hidden"
+        ></div>
+
+
+        <!-- APPROVAL STATUS -->
+
+        <div
+            id="approvalStatus"
+            class="approval-status hidden"
+        ></div>
+
+
+        <!-- GENERATED TRAVEL PLAN -->
+
+        <div
+            id="pdfContent"
+            class="pdf-content"
+        >
+
+            <div class="pdf-heading">
+
+                <div class="pdf-logo">
+                    ✦
+                </div>
+
+                <div>
+
+                    <span>
+                        VOYANTA
+                    </span>
+
+                    <h1 class="pdf-title">
+                        AI Travel Plan
+                    </h1>
 
                 </div>
 
@@ -243,71 +345,136 @@
 
 
             <div
-                id="pdfContent"
-                class="pdf-content"
-            >
+                id="resultBox"
+                class="result-box"
+            ></div>
 
-                <div class="pdf-heading">
+        </div>
 
-                    <div class="pdf-logo">
-                        ✦
-                    </div>
 
-                    <div>
-                        <span>VOYANTA</span>
-                        <h1 class="pdf-title">
-                            AI Travel Plan
-                        </h1>
-                    </div>
+        <!-- HUMAN REVIEW — NOW AT THE END -->
+
+        <div
+            id="approvalPanel"
+            class="approval-panel hidden"
+        >
+
+            <div class="approval-icon">
+                ✓
+            </div>
+
+
+            <div class="approval-content">
+
+                <span class="approval-eyebrow">
+                    HUMAN REVIEW REQUIRED
+                </span>
+
+                <h3>
+                    Review your itinerary
+                </h3>
+
+                <p id="approvalRequest">
+                    Please review the generated itinerary before finalizing
+                    your travel plan.
+                </p>
+
+
+                <label for="feedbackInput">
+
+                    Feedback
+
+                    <span>
+                        optional for approval
+                    </span>
+
+                </label>
+
+
+                <textarea
+                    id="feedbackInput"
+                    rows="3"
+                    placeholder="Tell Voyanta what you would like to change..."
+                ></textarea>
+
+
+                <div class="approval-actions">
+
+                    <button
+                        id="reviseBtn"
+                        class="revision-btn"
+                        type="button"
+                        onclick="requestRevision()"
+                    >
+
+                        <span>↻</span>
+
+                        Request Revision
+
+                    </button>
+
+
+                    <button
+                        id="approveBtn"
+                        class="approve-btn"
+                        type="button"
+                        onclick="approvePlan()"
+                    >
+
+                        <span>✓</span>
+
+                        Approve Plan
+
+                    </button>
 
                 </div>
 
-
-                <div
-                    id="resultBox"
-                    class="result-box"
-                ></div>
-
             </div>
 
-        </section>
+        </div>
+
+    </section>
 
 
-        <section
-            id="errorBox"
-            class="error-box hidden"
-            role="alert"
-        ></section>
+    <!-- ERROR -->
+
+    <section
+        id="errorBox"
+        class="error-box hidden"
+        role="alert"
+    ></section>
 
 
-        <footer>
+    <!-- FOOTER -->
 
-            <div class="footer-brand">
+    <footer>
 
-                <span class="brand-mark">
-                    ✦
-                </span>
+        <div class="footer-brand">
 
-                <strong>
-                    Voyanta
-                </strong>
-
-            </div>
-
-            <span>
-                Built with FastAPI · LangGraph · Groq · PostgreSQL · Tavily · AviationStack
+            <span class="brand-mark">
+                ✦
             </span>
 
-        </footer>
+            <strong>
+                Voyanta
+            </strong>
 
-    </main>
+        </div>
+
+        <span>
+            Built with FastAPI · LangGraph · Groq · PostgreSQL · Tavily · AviationStack · MCP
+        </span>
+
+    </footer>
+
+</main>
 
 
-    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
 
-    <script src="/static/script.js"></script>
+<script src="/static/script.js"></script>
 
 </body>
 </html>
