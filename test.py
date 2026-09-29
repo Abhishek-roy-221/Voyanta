@@ -1,19 +1,6 @@
-from tools.tavily_tool import tavily_search
-from tools.flight_tool import search_flights
-from backend import run_travel_agent
+import asyncio
+from main_client import get_all_tools
 
-# result = tavily_search("Top 5 best hotels in Patna,India")
-# print(result)
-
-# res = search_flights("plan a 7 days trip from japan to india")
-# print(res)
-
-user_input = input("Enter travel request: ")
-
-response = run_travel_agent(
-    user_input=user_input,
-    thread_id="test_user"
-)
-
-print("\nFINAL RESPONSE:\n")
-print(response["answer"])
+if __name__ == "__main__":
+    query = "latest news about india"
+    asyncio.run(get_all_tools())
