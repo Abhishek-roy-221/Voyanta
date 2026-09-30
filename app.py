@@ -68,9 +68,9 @@ async def travel_planner(request_data: TravelRequest):
                 },
             )
 
-        result = run_travel_agent(
-            user_input=user_message,
-            thread_id=request_data.thread_id,
+        result =  run_travel_agent(
+            user_message,
+            request_data.thread_id,
         )
 
         return JSONResponse(
@@ -111,7 +111,7 @@ async def resume_travel_plan(request_data: ApprovalRequest):
                 },
             )
 
-        result = resume_travel_agent(
+        result =  resume_travel_agent(
             thread_id=request_data.thread_id,
             approved=request_data.approved,
             feedback=request_data.feedback,

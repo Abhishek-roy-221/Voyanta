@@ -25,6 +25,8 @@ AVIATION_STACK_API_KEY = (
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
+RAILRADAR_API_KEY = os.getenv("RAILRADAR_API_KEY")
+
 WEATHER_SERVER_PATH = BASE_DIR / "weather_mcp_custom.py"
 UVX_COMMAND = shutil.which("uvx") or "uvx"
 
@@ -83,6 +85,17 @@ client = MultiServerMCPClient(
                 OPENWEATHER_API_KEY=OPENWEATHER_API_KEY,
             ),
         },
+
+        "train": {
+    "transport": "stdio",
+    "command": sys.executable,
+    "args": [
+        str(BASE_DIR / "train_mcp.py"),
+    ],
+    "env": _subprocess_env(
+        RAILRADAR_API_KEY=RAILRADAR_API_KEY,
+    ),
+},
     }
 )
 
@@ -122,6 +135,18 @@ async def _get_server_tool(
                 f"{WEATHER_SERVER_PATH}"
             )
 
+        elif server_name == "train":
+            _require_env(
+            "RAILRADAR_API_KEY",
+            RAILRADAR_API_KEY,
+        )
+
+        if not (BASE_DIR / "train_mcp.py").is_file():
+            raise FileNotFoundError(
+            f"Train MCP server not found: "
+            f"{BASE_DIR / 'train_mcp.py'}"
+        )
+
     tools = await client.get_tools(
         server_name=server_name,
     )
@@ -157,6 +182,7 @@ async def get_all_tools() -> None:
         "tavily",
         "aviationstack",
         "weather",
+        "train",
     ):
         try:
             tools = await client.get_tools(
@@ -231,6 +257,39 @@ async def forecast_mcp_search(city: str):
     return await forecast_tool.ainvoke(
         {
             "city": city,
+        }
+    )
+
+
+async def train_station_search(query: str):
+    station_tool = await _get_server_tool(
+        "train",
+        "search_stations",
+    )
+
+    return await station_tool.ainvoke(
+        {
+            "query": query,
+        }
+    )
+
+async def train_mcp_search(
+    from_location: str,
+    to_location: str,
+    date: str = "",
+    by_city: bool = True,
+):
+    train_tool = await _get_server_tool(
+        "train",
+        "search_trains",
+    )
+
+    return await train_tool.ainvoke(
+        {
+            "from_location": from_location,
+            "to_location": to_location,
+            "date": date,
+            "by_city": by_city,
         }
     )
 

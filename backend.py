@@ -11,9 +11,9 @@ import json
 
 import psycopg
 from psycopg.rows import dict_row
-
+from psycopg import AsyncConnection
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.types import Command,interrupt
-
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.postgres import PostgresSaver
 from langchain_core.messages import (AnyMessage,HumanMessage,AIMessage,SystemMessage)
@@ -22,7 +22,15 @@ from langchain_groq import ChatGroq
 # from tools.flight_tool import search_flights
 
 
-from mcp_client import tavily_mcp_search,aviation_mcp_call,extract_destination,forecast_mcp_search,weather_mcp_search
+from mcp_client import (
+    tavily_mcp_search,
+    aviation_mcp_call,
+    extract_destination,
+    forecast_mcp_search,
+    weather_mcp_search,
+    train_mcp_search,
+    train_station_search,
+)
 
 os.environ["SSL_CERT_FILE"] = certifi.where()
 os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
@@ -69,6 +77,7 @@ class TravelState(TypedDict, total=False):
 
     # Original specialist results
     flight_results: str
+    train_results: str
     hotel_results: str
     weather_results: str
     itinerary: str
@@ -108,22 +117,23 @@ class TravelState(TypedDict, total=False):
 #     }
 
 # shared helpers
-KNOWN_AGENTS = {
+KNOWN_AGENTS = [
     "flight_agent",
-    "hotel_agent",
-    "weather_agent",
-    "budget_agent",
-    "itinerary_agent",
-}
-
-AGENT_ORDER = [
-    "flight_agent",
+    "train_agent",
     "hotel_agent",
     "weather_agent",
     "budget_agent",
     "itinerary_agent",
 ]
 
+AGENT_ORDER = [
+    "flight_agent",
+    "train_agent",
+    "hotel_agent",
+    "weather_agent",
+    "budget_agent",
+    "itinerary_agent",
+]
 
 
 def _llm_text(system_prompt: str, user_prompt: str) -> str:
@@ -152,6 +162,7 @@ def _empty_constraints() -> dict[str, Any]:
         "destination": "",
         "origin": "",
         "duration": "",
+        "travel_date": "",
         "budget": "",
         "travel_style": "",
         "special_preferences": [],
@@ -224,11 +235,33 @@ You are the supervisor of a multi-agent travel-planning system.
 Choose only the specialist agents needed for the request.
 
 Available agents:
-- flight_agent: flights, airports, airlines, routes, airfare, or booking advice
-- hotel_agent: hotels, accommodation, neighborhoods, or places to stay
-- weather_agent: weather, climate, season, forecast, or packing advice
-- budget_agent: cost, affordability, price limits, or budget feasibility
-- itinerary_agent: creates the integrated travel plan and must always be included
+- flight_agent: flights, airports, airlines, routes, airfare, booking advice
+- train_agent: trains, railway routes, train schedules, and train travel
+- hotel_agent: hotels and accommodation
+- weather_agent: weather and climate information
+- budget_agent: trip cost estimation and budget analysis
+- itinerary_agent: builds the final day-by-day itinerary
+
+Transportation selection rules:
+
+1. If the user explicitly asks for flights or air travel:
+   select flight_agent.
+
+2. If the user explicitly asks for trains or railway travel:
+   select train_agent.
+
+3. If the user explicitly asks to compare flights and trains:
+   select both flight_agent and train_agent.
+
+4. If the trip is domestic and the user does not specify transportation:
+   select both flight_agent and train_agent so Voyanta can compare available options.
+
+5. If the trip is international and the user does not specify transportation:
+   select flight_agent for the main journey.
+
+6. Do not select train_agent for international journeys unless the user explicitly asks for train travel.
+
+7. Always select itinerary_agent.
 
 Return strict JSON only using this schema:
 {{
@@ -372,6 +405,249 @@ def flight_agent(state: TravelState):
 
 
 
+def train_agent(state: TravelState) -> dict:
+    query = state["user_query"]
+    constraints = state.get("trip_constraints", {})
+
+    origin = constraints.get("origin")
+    destination = constraints.get("destination")
+
+    if not origin or not destination:
+        return {
+            "train_results": (
+                "Train search could not be completed because "
+                "origin or destination is missing."
+            )
+        }
+
+    try:
+        origin_search = asyncio.run(
+            train_station_search(origin)
+        )
+
+        destination_search = asyncio.run(
+            train_station_search(destination)
+        )
+
+        station_prompt = f"""
+You are the railway location reasoning agent for Voyanta.
+
+User request:
+{query}
+
+Origin:
+{origin}
+
+Destination:
+{destination}
+
+Station search results for origin:
+{origin_search}
+
+Station search results for destination:
+{destination_search}
+
+Determine the railway stations most likely to have direct
+intercity train routes for this journey.
+
+Return exactly 2 candidate stations for each location.
+
+For Kolkata, prioritize:
+- Howrah Junction (HWH)
+- Sealdah (SDAH)
+- Kolkata Terminal (KOAA)
+
+For Delhi, prioritize:
+- New Delhi (NDLS)
+- Delhi Junction (DLI)
+- Anand Vihar Terminal (ANVT)
+
+Return only station codes that are present in the provided
+station search results or are standard Indian railway station codes.
+
+Important:
+- Prefer major railway stations.
+- Prefer stations belonging to the requested city or metropolitan area.
+- Use station codes present in the search results whenever possible.
+- Do not invent station codes.
+- Order candidates from most appropriate to least appropriate.
+- These candidates will be independently verified using RailRadar.
+
+Return ONLY JSON.
+
+Format:
+{{
+    "origin_candidates": [
+        {{
+            "station": "",
+            "code": ""
+        }}
+    ],
+    "destination_candidates": [
+        {{
+            "station": "",
+            "code": ""
+        }}
+    ]
+}}
+"""
+
+        station_response = _llm_text(
+            "You are a railway location reasoning agent for Voyanta.",
+            station_prompt,
+        )
+
+        try:
+            station_data = json.loads(station_response)
+        except json.JSONDecodeError:
+            return {
+                "train_results": (
+                    "Train station resolution failed because the "
+                    "LLM returned invalid JSON."
+                )
+            }
+
+        origin_candidates = station_data.get(
+            "origin_candidates",
+            []
+        )
+
+        destination_candidates = station_data.get(
+            "destination_candidates",
+            []
+        )
+
+        if not origin_candidates or not destination_candidates:
+            return {
+                "train_results": (
+                    f"Could not determine railway stations for "
+                    f"{origin} to {destination}."
+                )
+            }
+
+        verified_route = None
+
+        for origin_candidate in origin_candidates:
+            for destination_candidate in destination_candidates:
+
+                origin_code = origin_candidate.get("code")
+                destination_code = destination_candidate.get("code")
+
+                if not origin_code or not destination_code:
+                    continue
+
+                train_result = asyncio.run(
+                    train_mcp_search(
+                        from_location=origin_code,
+                        to_location=destination_code,
+                        date="",
+                        by_city=False,
+                    )
+                )
+
+                result_text = str(train_result)
+
+                if (
+                    "trains" in result_text.lower()
+                    and '"count": 0' not in result_text
+                ):
+                    verified_route = {
+                        "origin": origin_candidate,
+                        "destination": destination_candidate,
+                        "result": train_result,
+                    }
+                    break
+
+            if verified_route:
+                break
+
+        if not verified_route:
+            return {
+                "train_results": (
+                    f"No verified train routes were found between "
+                    f"{origin} and {destination}."
+                )
+            }
+
+        origin_station = verified_route["origin"]["station"]
+        origin_code = verified_route["origin"]["code"]
+
+        destination_station = verified_route["destination"]["station"]
+        destination_code = verified_route["destination"]["code"]
+
+        train_result = verified_route["result"]
+
+        summary_prompt = f"""
+You are the Train Research Agent for Voyanta.
+
+User request:
+{query}
+
+Verified route:
+{origin_station} ({origin_code}) -> {destination_station} ({destination_code})
+
+RailRadar data:
+{train_result}
+
+Return ONLY valid JSON.
+
+Format:
+{{
+    "origin_station": "",
+    "origin_code": "",
+    "destination_station": "",
+    "destination_code": "",
+    "trains": [
+        {{
+            "number": "",
+            "name": "",
+            "type": "",
+            "departure": "",
+            "arrival": "",
+            "duration": "",
+            "distance_km": "",
+            "running_days": ""
+        }}
+    ]
+}}
+
+Rules:
+- Include at most 5 trains.
+- Use ONLY information from RailRadar data.
+- Do not invent information.
+- Do not include fares.
+- Do not include seat availability.
+- Do not include booking advice.
+- Do not include recommendations.
+- Do not include explanations.
+- Do not include Markdown.
+- Return JSON only.
+"""
+
+        response = _llm_text(
+            "You are the Train Research Agent for Voyanta.",
+            summary_prompt,
+)
+
+        try:
+            train_data = json.loads(response)
+        except json.JSONDecodeError:
+            return {
+        "train_results": {
+            "error": "Train agent returned invalid JSON."
+        }
+    }
+
+        return {
+    "train_results": train_data,
+}
+    except Exception as exc:
+        return {
+            "train_results": (
+                f"Train research failed: {type(exc).__name__}: {exc}"
+            )
+        }
+
 
 def hotel_agent(state: TravelState):
     query = (
@@ -509,7 +785,7 @@ If exact live prices are unavailable, clearly label estimates as approximate.
 
 def itinerary_agent(state: TravelState):
     prompt = f"""
-Create a complete travel itinerary.
+Create a concise day-by-day travel itinerary.
 
 User Query:
 {state['user_query']}
@@ -517,41 +793,80 @@ User Query:
 Trip Constraints:
 {state.get('trip_constraints', {})}
 
-Flight Results:
+Flight Information:
 {state.get('flight_results', '')}
 
-Hotel Results:
+Train Information:
+{state.get('train_results', {})}
+
+Hotel Information:
 {state.get('hotel_results', '')}
 
-Weather Results:
+Weather Information:
 {state.get('weather_results', '')}
 
-Budget Results:
+Budget Information:
 {state.get('budget_results', '')}
 
-Make the itinerary practical, budget-aware, and easy to follow.
-Create a clear draft that is ready for human review.
+Create ONLY the day-by-day itinerary.
+
+For each day include:
+- Morning
+- Afternoon
+- Evening
+- Important travel/transfer times when relevant
+- Main activities and places
+
+Rules:
+- Keep each day concise.
+- Do not create a separate flight section.
+- Do not create a separate train section.
+- Do not create a booking guide.
+- Do not explain how to book tickets.
+- Do not mention IRCTC or external booking websites.
+- Do not create safety tips.
+- Do not create food hygiene advice.
+- Do not create packing advice.
+- Do not create women traveler advice.
+- Do not create generic travel tips.
+- Do not create a "Sample Day-by-Day Narrative".
+- Do not repeat complete flight or train details.
+- Use the verified flight/train information only when necessary for
+  scheduling the day.
+- Do not invent specific booking availability.
+- Do not invent ticket prices.
+- Do not invent train or flight numbers.
+- Do not add information unrelated to the itinerary.
+- Keep the entire itinerary concise and easy to scan.
+
+The output should contain only the day-by-day itinerary.
 """
 
     response = llm.invoke(
         [
-            SystemMessage(content="You are an expert travel planner."),
+            SystemMessage(
+                content="You are a concise travel itinerary planner."
+            ),
             HumanMessage(content=prompt),
         ]
     )
 
     approval_request = (
-        "Please review the generated draft itinerary. Approve it to create the "
-        "final polished plan, or provide feedback for revision."
+        "Please review the generated draft itinerary. "
+        "Approve it to create the final polished plan, "
+        "or provide feedback for revision."
     )
 
     return {
         "itinerary": response.content,
         "approval_request": approval_request,
-        "messages": [AIMessage(content="Draft itinerary created for human review.")],
+        "messages": [
+            AIMessage(
+                content="Draft itinerary created for human review."
+            )
+        ],
         "llm_calls": state.get("llm_calls", 0) + 1,
     }
-
 
 
 # Human-in-the-Loop approval
@@ -662,8 +977,8 @@ Important:
 # Dynamic Supervisor Routing
 
 ROUTE_MAP = {
-    "guardrail_blocked": "guardrail_blocked",
     "flight_agent": "flight_agent",
+    "train_agent": "train_agent",
     "hotel_agent": "hotel_agent",
     "weather_agent": "weather_agent",
     "budget_agent": "budget_agent",
@@ -705,6 +1020,7 @@ graph = StateGraph(TravelState)
 graph.add_node("supervisor", supervisor_agent)
 graph.add_node("guardrail_blocked", guardrail_blocked_agent)
 graph.add_node("flight_agent", flight_agent)
+graph.add_node("train_agent", train_agent)
 graph.add_node("hotel_agent", hotel_agent)
 graph.add_node("weather_agent", weather_agent)
 graph.add_node("budget_agent", budget_agent)
@@ -717,6 +1033,11 @@ graph.add_conditional_edges("supervisor", route_from_supervisor, ROUTE_MAP)
 
 graph.add_conditional_edges(
     "flight_agent", route_after_agent("flight_agent"), ROUTE_MAP
+)
+graph.add_conditional_edges(
+    "train_agent",
+    route_after_agent("train_agent"),
+    ROUTE_MAP
 )
 graph.add_conditional_edges(
     "hotel_agent", route_after_agent("hotel_agent"), ROUTE_MAP
@@ -804,16 +1125,25 @@ def _serialize_result(
     }
 
 
-def run_travel_agent(user_input: str, thread_id: str | None = None):
+def run_travel_agent(
+    user_input: str,
+    thread_id: str | None = None,
+):
     """Start a new travel-planning run and pause at human approval."""
     if not thread_id:
         thread_id = f"user_{uuid.uuid4().hex}"
 
-    config = {"configurable": {"thread_id": thread_id}}
+    config = {
+        "configurable": {
+            "thread_id": thread_id
+        }
+    }
 
-    result = travel_graph.invoke(
+    result =  travel_graph.invoke(
         {
-            "messages": [HumanMessage(content=user_input)],
+            "messages": [
+                HumanMessage(content=user_input)
+            ],
             "user_query": user_input,
             "guardrail_allowed": True,
             "guardrail_reason": "",
@@ -821,6 +1151,7 @@ def run_travel_agent(user_input: str, thread_id: str | None = None):
             "trip_constraints": _empty_constraints(),
             "supervisor_reasoning": "",
             "flight_results": "",
+            "train_results": {},
             "hotel_results": "",
             "weather_results": "",
             "budget_results": "",
@@ -834,7 +1165,10 @@ def run_travel_agent(user_input: str, thread_id: str | None = None):
         config=config,
     )
 
-    return _serialize_result(result, thread_id)
+    return _serialize_result(
+        result,
+        thread_id,
+    )
 
 
 def resume_travel_agent(
@@ -844,9 +1178,16 @@ def resume_travel_agent(
 ):
     """Resume the paused LangGraph thread after human review."""
     if not thread_id:
-        raise ValueError("thread_id is required to resume a travel plan.")
+        raise ValueError(
+            "thread_id is required to resume a travel plan."
+        )
 
-    config = {"configurable": {"thread_id": thread_id}}
+    config = {
+        "configurable": {
+            "thread_id": thread_id
+        }
+    }
+
     result = travel_graph.invoke(
         Command(
             resume={
@@ -857,4 +1198,8 @@ def resume_travel_agent(
         config=config,
     )
 
-    return _serialize_result(result, thread_id)
+    return _serialize_result(
+        result,
+        thread_id,
+    )
+
