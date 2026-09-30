@@ -18,6 +18,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.postgres import PostgresSaver
 from langchain_core.messages import (AnyMessage,HumanMessage,AIMessage,SystemMessage)
 from langchain_groq import ChatGroq
+from pydantic import BaseModel, Field
 # from tools.tavily_tool import tavily_search
 # from tools.flight_tool import search_flights
 
@@ -54,11 +55,13 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
     raise ValueError("GROQ_API_KEY is missing. Please add it to your .env file.")
 
-
+GROQ_MODEL = "openai/gpt-oss-120b"
 
 llm = ChatGroq(
-    model="openai/gpt-oss-120b",
-    api_key=GROQ_API_KEY
+    model=GROQ_MODEL,
+    api_key=GROQ_API_KEY,
+    temperature=0.2,
+    max_retries=2,
 )
 
 
@@ -136,6 +139,167 @@ AGENT_ORDER = [
 ]
 
 
+# Structured-output schemas (Groq strict JSON schema / LangChain with_structured_output)
+
+class GuardrailDecision(BaseModel):
+    allowed: bool = Field(
+        description="True if the request is about travel planning or travel information."
+    )
+    reason: str = Field(
+        description="Short user-facing reason. Use an empty string when allowed is true.",
+    )
+
+
+class TripConstraints(BaseModel):
+    origin: str = Field(description="Departure city/place exactly as the user gave it. Empty if not stated.")
+    destination: str = Field(description="Destination city/place. Empty if not stated.")
+    duration: str = Field(description="Trip length, e.g. '5 days'. Empty if not stated.")
+    travel_date: str = Field(description="Travel date or month if stated. Empty otherwise.")
+    budget: str = Field(description="Budget as stated, e.g. '₹30,000'. Empty if not stated.")
+    num_travelers: str = Field(description="Number of travelers if stated. Empty otherwise.")
+    travel_style: str = Field(description="Style such as budget, luxury, family, adventure. Empty if not stated.")
+    transportation_preference: str = Field(description="Train, flight, both, etc. if stated. Empty otherwise.")
+    hotel_requirements: str = Field(description="Explicit hotel requirements if stated. Empty otherwise.")
+    weather_requirements: str = Field(description="Explicit weather needs if stated. Empty otherwise.")
+    special_preferences: list[str] = Field(
+        description="Other explicit preferences or constraints stated by the user. Use an empty list when none are stated.",
+    )
+
+
+class SupervisorDecision(BaseModel):
+    selected_agents: list[str] = Field(
+        description=(
+            "Agents to run. Allowed values: flight_agent, train_agent, hotel_agent, "
+            "weather_agent, budget_agent, itinerary_agent."
+        )
+    )
+    trip_constraints: TripConstraints
+    reasoning: str = Field(description="One or two sentences explaining the routing.")
+
+
+class StationCandidate(BaseModel):
+    station: str = Field(description="Station name.")
+    code: str = Field(description="Railway station code.")
+
+
+class StationSelection(BaseModel):
+    origin_candidates: list[StationCandidate] = Field(description="Candidate origin stations. Use an empty list if none can be determined.")
+    destination_candidates: list[StationCandidate] = Field(description="Candidate destination stations. Use an empty list if none can be determined.")
+
+
+class TrainInfo(BaseModel):
+    number: str
+    name: str
+    type: str
+    departure: str
+    arrival: str
+    duration: str
+    distance_km: str
+    running_days: str
+
+
+class TrainSummary(BaseModel):
+    trains: list[TrainInfo] = Field(description="Verified train results. Use an empty list when no trains are available.")
+
+class HotelInfo(BaseModel):
+    name: str = Field(description="Actual hotel/property name, not a listing-page title.")
+    area: str = Field(description="Neighbourhood/area or location text if stated. Empty if not stated.")
+    category: str = Field(description="Star class or type (budget, 3-star, 5-star, etc.) if stated. Empty if not stated.")
+    rating: str = Field(description="Rating exactly as stated, e.g. '8.6/10'. Empty if not stated.")
+    price_per_night: str = Field(description="Price exactly as written incl. currency symbol, e.g. '₹2,499'. Empty if not stated.")
+    highlights: str = Field(description="Short factual highlights stated in the text (breakfast, pool, free cancellation...). Empty if not stated.")
+    source_title: str = Field(description="Title of the page this came from. Empty if not available.")
+    source_url: str = Field(description="URL of the page this came from. Empty if not available.")
+
+
+class HotelSummary(BaseModel):
+    hotels: list[HotelInfo] = Field(description="Hotel results. Use an empty list when no verified hotels are available.")
+    price_note: str = Field(description="One line about price currency/coverage limits found in the data. Empty if no note is needed.")
+# Groq response helpers
+
+def _content_to_text(content: Any) -> str:
+    """Convert LangChain/Gemini message content (str, content blocks, dicts) to plain text."""
+    if content is None:
+        return ""
+
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, dict):
+        text = content.get("text")
+        if isinstance(text, str):
+            return text
+        return json.dumps(content, ensure_ascii=False, default=str)
+
+    if isinstance(content, (list, tuple)):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                block_type = item.get("type")
+                text = item.get("text")
+                # Only visible text blocks; skip thinking/tool/other blocks.
+                if isinstance(text, str) and block_type in (None, "text"):
+                    parts.append(text)
+            else:
+                text = getattr(item, "text", None)
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+
+    text = getattr(content, "text", None)
+    if isinstance(text, str):
+        return text
+
+    return str(content)
+
+
+def _data_to_text(value: Any) -> str:
+    """Convert tool output (str / dict / list / MCP-style blocks) to readable text without losing fields."""
+    if value is None:
+        return ""
+
+    if isinstance(value, str):
+        return value
+
+    if isinstance(value, (list, tuple)) and value and all(
+        isinstance(item, dict) and item.get("type") == "text" for item in value
+    ):
+        return _content_to_text(value)
+
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, ensure_ascii=False, indent=2, default=str)
+
+    content = getattr(value, "content", None)
+    if content is not None:
+        return _data_to_text(content)
+
+    return str(value)
+
+
+def _json_safe(value: Any) -> Any:
+    """Make any value safe for JSONResponse."""
+    try:
+        return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+    except Exception:
+        return str(value)
+
+
+def _looks_like_api_error(text: str) -> bool:
+    lowered = text.lower()
+    markers = (
+        "api_error",
+        "function_access_restricted",
+        "does not support this api function",
+        "subscription plan",
+        "invalid_access_key",
+        "usage_limit_reached",
+        "access_restricted",
+    )
+    return any(marker in lowered for marker in markers)
+
+
 def _llm_text(system_prompt: str, user_prompt: str) -> str:
     response = llm.invoke(
         [
@@ -143,18 +307,37 @@ def _llm_text(system_prompt: str, user_prompt: str) -> str:
             HumanMessage(content=user_prompt),
         ]
     )
-    return str(response.content)
+    return _content_to_text(response.content)
 
 
-def _json_from_llm(text: str) -> dict[str, Any]:
-    """Extract the first complete JSON object returned by the model."""
-    start = text.find("{")
-    end = text.rfind("}")
+def _llm_structured(system_prompt: str, user_prompt: str, schema: type[BaseModel]):
+    """Invoke Groq with native structured output and return a validated schema instance."""
+    messages = [
+        SystemMessage(
+            content=(
+                system_prompt
+                + "\nReturn ONLY a JSON object that matches the requested schema. "
+                "Do not add commentary outside the JSON object."
+            )
+        ),
+        HumanMessage(content=user_prompt),
+    ]
 
-    if start == -1 or end == -1 or end < start:
-        raise ValueError("The model did not return a JSON object.")
+    structured_llm = llm.with_structured_output(
+        schema,
+        method="json_schema",
+        strict=True,
+    )
+    result = structured_llm.invoke(messages)
 
-    return json.loads(text[start : end + 1])
+    if isinstance(result, schema):
+        return result
+    if isinstance(result, dict):
+        return schema.model_validate(result)
+    if isinstance(result, BaseModel):
+        return schema.model_validate(result.model_dump())
+
+    raise ValueError(f"Structured output was not returned for {schema.__name__}.")
 
 
 def _empty_constraints() -> dict[str, Any]:
@@ -164,49 +347,385 @@ def _empty_constraints() -> dict[str, Any]:
         "duration": "",
         "travel_date": "",
         "budget": "",
+        "num_travelers": "",
         "travel_style": "",
+        "transportation_preference": "",
+        "hotel_requirements": "",
+        "weather_requirements": "",
         "special_preferences": [],
     }
 
 
+def _fallback_constraints(query: str) -> dict[str, Any]:
+    """Best-effort deterministic extraction used only when supervisor LLM parsing fails."""
+    import re
 
+    constraints = _empty_constraints()
+    text = query.strip()
+
+    route = re.search(
+        r"\bfrom\s+(.+?)\s+to\s+(.+?)(?:\s+(?:for|with|on|in|under|budget|starting)|$)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if route:
+        constraints["origin"] = route.group(1).strip(" ,.-")
+        constraints["destination"] = route.group(2).strip(" ,.-")
+    else:
+        route = re.search(
+            r"\b([A-Za-z][A-Za-z .'-]{1,40})\s+to\s+([A-Za-z][A-Za-z .'-]{1,40})(?:\s+(?:for|with|on|in|under|budget|and)|$)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if route:
+            constraints["origin"] = route.group(1).strip(" ,.-")
+            constraints["destination"] = route.group(2).strip(" ,.-")
+
+    duration = re.search(r"\b(\d+)\s*(day|days|night|nights)\b", text, re.IGNORECASE)
+    if duration:
+        constraints["duration"] = f"{duration.group(1)} {duration.group(2)}"
+
+    travelers = re.search(
+        r"\b(?:for|with)\s+(\d+)\s+(?:people|persons|travelers|travellers|adults)\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if travelers:
+        constraints["num_travelers"] = travelers.group(1)
+
+    budget = re.search(
+        r"(?:₹|Rs\.?|INR\s*)\s*([\d,]+)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if budget:
+        constraints["budget"] = f"₹{budget.group(1)}"
+
+    lowered = text.lower()
+    if any(word in lowered for word in ("train", "railway", "rail")):
+        constraints["transportation_preference"] = "train"
+    elif any(word in lowered for word in ("flight", "flights", "airplane", "air travel")):
+        constraints["transportation_preference"] = "flight"
+
+    if any(word in lowered for word in ("hotel", "stay", "accommodation", "resort")):
+        constraints["hotel_requirements"] = "Requested in user query"
+    if any(word in lowered for word in ("weather", "climate", "forecast")):
+        constraints["weather_requirements"] = "Requested in user query"
+
+    return constraints
+
+
+def _fallback_selected_agents(query: str, constraints: dict[str, Any]) -> list[str]:
+    lowered = query.lower()
+    selected: list[str] = []
+
+    if any(word in lowered for word in ("flight", "flights", "airline", "airport", "fly", "air travel")):
+        selected.append("flight_agent")
+    if any(word in lowered for word in ("train", "railway", "rail", "vande bharat", "express train")):
+        selected.append("train_agent")
+
+    domestic_hint = bool(constraints.get("origin") and constraints.get("destination"))
+    if domestic_hint and not selected and any(
+        word in lowered for word in ("trip", "travel", "plan", "itinerary", "holiday", "vacation")
+    ):
+        selected.extend(["flight_agent", "train_agent"])
+
+    if any(word in lowered for word in ("hotel", "stay", "accommodation", "resort")) or "trip" in lowered or "travel" in lowered:
+        selected.append("hotel_agent")
+    if any(word in lowered for word in ("weather", "climate", "forecast", "packing")) or "trip" in lowered or "travel" in lowered:
+        selected.append("weather_agent")
+    if constraints.get("budget") or any(word in lowered for word in ("budget", "cost", "price", "how much", "expenses")) or "trip" in lowered or "travel" in lowered:
+        selected.append("budget_agent")
+
+    selected.append("itinerary_agent")
+    return [agent for agent in AGENT_ORDER if agent in selected]
+
+
+
+# Presentation helpers (deterministic - no LLM, no invented data)
+
+def _maybe_json(value: Any) -> Any:
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except Exception:
+            return value
+    return value
+
+
+def _md_cell(value: Any) -> str:
+    text = str(value if value is not None else "").replace("|", "\\|").replace("\n", " ").strip()
+    return text or "-"
+
+
+def _fmt_num(value: Any) -> str:
+    try:
+        return f"{round(float(value), 1)}"
+    except Exception:
+        return _md_cell(value)
+
+
+def _short_api_error(text: str) -> str:
+    parsed = _maybe_json(text.strip())
+    if isinstance(parsed, dict):
+        err = parsed.get("error") or parsed.get("message")
+        if err:
+            return str(err)
+    return text.strip()[:300]
+
+
+def _md_table(headers: list[str], rows: list[list[Any]]) -> str:
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "|" + "|".join(["---"] * len(headers)) + "|",
+    ]
+    for row in rows:
+        lines.append("| " + " | ".join(_md_cell(cell) for cell in row) + " |")
+    return "\n".join(lines)
+
+
+def _preview_trains(train: Any) -> str:
+    if not train:
+        return "Train search did not return any result."
+    if isinstance(train, str):
+        return train
+
+    trains = train.get("trains") or []
+    origin = " ".join(x for x in [train.get("origin_station", ""), f"({train['origin_code']})" if train.get("origin_code") else ""] if x)
+    dest = " ".join(x for x in [train.get("destination_station", ""), f"({train['destination_code']})" if train.get("destination_code") else ""] if x)
+
+    out = []
+    if origin or dest:
+        out.append(f"**Verified route:** {origin or '-'} → {dest or '-'} · Source: {train.get('data_source', 'RailRadar')}")
+    if not trains:
+        out.append("No trains were returned for this route.")
+        return "\n\n".join(out)
+
+    out.append(
+        _md_table(
+            ["Train", "Name", "Type", "Departure", "Arrival", "Duration", "Distance (km)", "Running days"],
+            [
+                [t.get("number"), t.get("name"), t.get("type"), t.get("departure"),
+                 t.get("arrival"), t.get("duration"), t.get("distance_km"), t.get("running_days")]
+                for t in trains
+            ],
+        )
+    )
+    return "\n\n".join(out)
+
+
+def _preview_flights(flights: Any) -> str:
+    text = _data_to_text(flights).strip()
+    if not text:
+        return "Flight search did not return any result."
+    if text.lower().startswith("flight data unavailable") or text.lower().startswith("flight information unavailable"):
+        return "> " + text.replace("\n", "\n> ")
+    return text
+
+
+def _preview_hotels(raw: Any) -> str:
+    data = _maybe_json(raw)
+    if not isinstance(data, dict):
+        return _data_to_text(raw) or "Hotel search did not return any result."
+
+    hotels = data.get("hotels") or []
+    if not hotels:
+        return "No hotel details could be extracted from the search results."
+
+    rows = []
+    for h in hotels:
+        url = h.get("source_url", "")
+        title = h.get("source_title", "") or "Source"
+        source = f"[{title[:40]}]({url})" if url else "-"
+        rows.append([
+            f"**{h.get('name', '-')}**",
+            h.get("area"),
+            h.get("category"),
+            h.get("rating"),
+            h.get("price_per_night") or "Not listed",
+            h.get("highlights"),
+            source,
+        ])
+
+    out = [_md_table(["Hotel", "Area", "Category", "Rating", "Price / night", "Highlights", "Source"], rows)]
+    if data.get("price_note"):
+        out.append(f"_{data['price_note']}_")
+    out.append("_Prices are copied from search-result snippets exactly as listed (currency not converted) and may change. Confirm on the booking site._")
+    return "\n\n".join(out)
+
+
+def _preview_weather(raw: Any) -> str:
+    data = _maybe_json(raw)
+    if not isinstance(data, dict):
+        return _data_to_text(raw) or "Weather data unavailable."
+
+    current = _maybe_json(data.get("current"))
+    forecast = _maybe_json(data.get("forecast"))
+    out = []
+
+    if isinstance(current, dict):
+        rows = []
+        for key, label, suffix in (
+            ("temperature_c", "Temperature", " °C"),
+            ("feels_like_c", "Feels like", " °C"),
+            ("condition", "Condition", ""),
+            ("humidity", "Humidity", " %"),
+            ("wind_speed", "Wind speed", ""),
+        ):
+            value = current.get(key)
+            if value not in (None, ""):
+                shown = _fmt_num(value) if key.endswith("_c") or key == "wind_speed" else value
+                rows.append([label, f"{shown}{suffix}"])
+        if rows:
+            out.append("**Current weather**\n\n" + _md_table(["Metric", "Value"], rows))
+    elif isinstance(current, str) and current.strip():
+        out.append(current.strip())
+
+    items = forecast.get("forecast") if isinstance(forecast, dict) else forecast
+    if isinstance(items, list) and items:
+        rows = [
+            [i.get("datetime"), _fmt_num(i.get("temperature_c")), i.get("condition")]
+            for i in items if isinstance(i, dict)
+        ]
+        if rows:
+            out.append("**Forecast**\n\n" + _md_table(["Time", "Temp (°C)", "Condition"], rows))
+    elif isinstance(forecast, str) and forecast.strip():
+        out.append(forecast.strip())
+
+    return "\n\n".join(out) or "Weather data unavailable."
+
+
+def _build_plan_preview(state: dict[str, Any]) -> str:
+    """Readable draft shown at the approval step, built only from data the agents returned."""
+    selected = state.get("selected_agents", []) or []
+    constraints = state.get("trip_constraints", {}) or {}
+
+    parts: list[str] = [
+        "# Draft Travel Plan\n\n_Review the draft below. Approve it to get the polished final plan, or request changes._"
+    ]
+
+    labels = [
+        ("origin", "Origin"), ("destination", "Destination"), ("duration", "Duration"),
+        ("travel_date", "Travel date"), ("budget", "Budget"), ("num_travelers", "Travelers"),
+        ("transportation_preference", "Transport"), ("travel_style", "Style"),
+    ]
+    rows = [[label, constraints.get(key)] for key, label in labels if constraints.get(key)]
+    prefs = constraints.get("special_preferences") or []
+    if prefs:
+        rows.append(["Preferences", ", ".join(str(p) for p in prefs)])
+    if rows:
+        parts.append("## Trip Summary\n\n" + _md_table(["Detail", "Value"], rows))
+
+    transport = []
+    if "train_agent" in selected:
+        transport.append("### Trains\n\n" + _preview_trains(state.get("train_results")))
+    if "flight_agent" in selected:
+        transport.append("### Flights\n\n" + _preview_flights(state.get("flight_results")))
+    if transport:
+        parts.append("## Transportation\n\n" + "\n\n".join(transport))
+
+    if "hotel_agent" in selected:
+        parts.append("## Hotels\n\n" + _preview_hotels(state.get("hotel_results")))
+
+    if "weather_agent" in selected:
+        parts.append("## Weather\n\n" + _preview_weather(state.get("weather_results")))
+
+    if "budget_agent" in selected and state.get("budget_results"):
+        parts.append("## Budget\n\n" + _content_to_text(state.get("budget_results")))
+
+    itinerary = _content_to_text(state.get("itinerary", ""))
+    if itinerary:
+        parts.append("## Itinerary\n\n" + itinerary)
+
+    return "\n\n".join(parts) + "\n"
 
 # Supervisor Agent + Input Guardrail
 
-def supervisor_agent(state: TravelState):
-    query = state["user_query"]
-    llm_calls = state.get("llm_calls", 0)
+GUARDRAIL_SYSTEM_PROMPT = (
+    "You are the input guardrail for Voyanta, a travel-planning application. "
+    "Decide only whether the request is allowed."
+)
 
-    guardrail_prompt = f"""
-Determine whether the following request belongs to travel planning or travel
-information. Valid requests can include destinations, flights, hotels, weather,
-budgets, visas, transportation, sightseeing, food, packing, or itineraries.
+GUARDRAIL_PROMPT = """
+Decide whether the user's request is about travel planning or travel information.
 
-Block clearly unrelated requests and requests asking for harmful or illegal
-instructions. Do not block a valid travel request merely because some details
-are missing.
+ALLOW requests about: trips and itineraries, destinations, flights, trains,
+hotels and accommodation, weather, budgets and costs, visas, local transport,
+sightseeing, food while travelling, and packing.
 
-Return strict JSON only:
-{{
-  "allowed": true,
-  "reason": ""
-}}
+ALLOW a travel request even when details are missing (no dates, budget, or
+origin). Missing information is never a reason to block.
+
+BLOCK only requests that are clearly unrelated to travel (for example coding
+help, homework, or general chat) or that ask for harmful or illegal
+instructions. If blocked, give a short, polite reason that tells the user
+Voyanta helps with travel planning.
 
 User request:
 {query}
 """
 
-    # Fail open on parser/model errors so a temporary JSON-format issue does not
-    # break the original travel-planning behavior.
+SUPERVISOR_SYSTEM_PROMPT = (
+    "You are the supervisor of Voyanta, a multi-agent travel-planning system. "
+    "You extract trip details and route work to specialist agents."
+)
+
+SUPERVISOR_PROMPT = """
+Read the user's travel request, extract the trip details, and choose which
+specialist agents should run.
+
+Available agents:
+- flight_agent: flights, airports, airlines, air routes
+- train_agent: train routes, schedules and railway travel (India rail data)
+- hotel_agent: hotels and accommodation search
+- weather_agent: current weather and forecast for the destination
+- budget_agent: trip cost breakdown and budget feasibility
+- itinerary_agent: day-by-day itinerary (always required)
+
+Extract trip_constraints ONLY from what the user actually wrote:
+origin, destination, duration, travel_date, budget, num_travelers,
+travel_style, transportation_preference, hotel_requirements,
+weather_requirements, special_preferences.
+Leave a field empty ("" or []) when the user did not state it. Never guess or
+invent values.
+
+Transportation rules:
+1. Flights or air travel requested -> flight_agent.
+2. Trains or railways requested -> train_agent.
+3. Comparison of flights and trains -> both.
+4. Domestic trip with no stated transport preference -> both flight_agent and train_agent.
+5. International trip with no stated preference -> flight_agent only.
+6. Never add train_agent for international trips unless the user explicitly asks for trains.
+
+Other agent rules:
+- hotel_agent: select when the user asks about hotels/stay/accommodation, or asks for a full trip plan.
+- weather_agent: select when the user asks about weather/climate/packing, or asks for a full trip plan.
+- budget_agent: select when the user mentions a budget, cost, or price, or asks for a full trip plan.
+- itinerary_agent: ALWAYS select it.
+- Do not select agents that are clearly irrelevant to the request.
+
+Give a one or two sentence reasoning for your routing.
+
+User request:
+{query}
+"""
+
+
+def supervisor_agent(state: TravelState):
+    query = state["user_query"]
+    llm_calls = state.get("llm_calls", 0)
+
+    # Fail open on model errors so a temporary issue does not block valid travel requests.
     try:
-        guardrail_raw = _llm_text(
-            "You are the input guardrail for a travel-planning application. "
-            "Return strict JSON only.",
-            guardrail_prompt,
+        decision = _llm_structured(
+            GUARDRAIL_SYSTEM_PROMPT,
+            GUARDRAIL_PROMPT.format(query=query),
+            GuardrailDecision,
         )
-        guardrail_result = _json_from_llm(guardrail_raw)
-        allowed = bool(guardrail_result.get("allowed", True))
-        guardrail_reason = str(guardrail_result.get("reason", "")).strip()
+        allowed = bool(decision.allowed)
+        guardrail_reason = decision.reason.strip()
         llm_calls += 1
     except Exception as exc:
         print(f"Guardrail fallback used: {exc}")
@@ -215,8 +734,8 @@ User request:
 
     if not allowed:
         reason = guardrail_reason or (
-            "TripMate AI can only help with travel-planning requests. "
-            "Please ask about a destination, flight, hotel, weather, budget, "
+            "Voyanta can only help with travel-planning requests. "
+            "Please ask about a destination, flight, train, hotel, weather, budget, "
             "or itinerary."
         )
         return {
@@ -230,64 +749,14 @@ User request:
             "llm_calls": llm_calls,
         }
 
-    supervisor_prompt = f"""
-You are the supervisor of a multi-agent travel-planning system.
-Choose only the specialist agents needed for the request.
-
-Available agents:
-- flight_agent: flights, airports, airlines, routes, airfare, booking advice
-- train_agent: trains, railway routes, train schedules, and train travel
-- hotel_agent: hotels and accommodation
-- weather_agent: weather and climate information
-- budget_agent: trip cost estimation and budget analysis
-- itinerary_agent: builds the final day-by-day itinerary
-
-Transportation selection rules:
-
-1. If the user explicitly asks for flights or air travel:
-   select flight_agent.
-
-2. If the user explicitly asks for trains or railway travel:
-   select train_agent.
-
-3. If the user explicitly asks to compare flights and trains:
-   select both flight_agent and train_agent.
-
-4. If the trip is domestic and the user does not specify transportation:
-   select both flight_agent and train_agent so Voyanta can compare available options.
-
-5. If the trip is international and the user does not specify transportation:
-   select flight_agent for the main journey.
-
-6. Do not select train_agent for international journeys unless the user explicitly asks for train travel.
-
-7. Always select itinerary_agent.
-
-Return strict JSON only using this schema:
-{{
-  "selected_agents": ["flight_agent", "hotel_agent", "weather_agent", "budget_agent", "itinerary_agent"],
-  "trip_constraints": {{
-    "destination": "",
-    "origin": "",
-    "duration": "",
-    "budget": "",
-    "travel_style": "",
-    "special_preferences": []
-  }},
-  "reasoning": ""
-}}
-
-User request:
-{query}
-"""
-
     try:
-        supervisor_raw = _llm_text(
-            "You route work to travel specialist agents. Return strict JSON only.",
-            supervisor_prompt,
+        parsed = _llm_structured(
+            SUPERVISOR_SYSTEM_PROMPT,
+            SUPERVISOR_PROMPT.format(query=query),
+            SupervisorDecision,
         )
-        parsed = _json_from_llm(supervisor_raw)
-        requested_agents = parsed.get("selected_agents", [])
+
+        requested_agents = parsed.selected_agents
         selected_agents = [
             name for name in AGENT_ORDER
             if name in requested_agents and name in KNOWN_AGENTS
@@ -298,20 +767,19 @@ User request:
             selected_agents.append("itinerary_agent")
 
         constraints = _empty_constraints()
-        parsed_constraints = parsed.get("trip_constraints", {})
-        if isinstance(parsed_constraints, dict):
-            constraints.update(parsed_constraints)
+        for key, value in parsed.trip_constraints.model_dump().items():
+            if value not in ("", None, []):
+                constraints[key] = value
 
-        reasoning = str(parsed.get("reasoning", "")).strip()
+        reasoning = parsed.reasoning.strip()
         llm_calls += 1
     except Exception as exc:
         print(f"Supervisor fallback used: {exc}")
-        # Original workflow behavior is preserved as the fallback.
-        selected_agents = AGENT_ORDER.copy()
-        constraints = _empty_constraints()
+        constraints = _fallback_constraints(query)
+        selected_agents = _fallback_selected_agents(query, constraints)
         reasoning = (
-            "Supervisor parsing failed, so the original full travel workflow "
-            "was selected as a safe fallback."
+            "Supervisor structured output failed, so Voyanta used deterministic "
+            "keyword and route extraction as a fallback."
         )
 
     return {
@@ -341,31 +809,44 @@ def guardrail_blocked_agent(state: TravelState):
 
 # Flight Tool Router Prompt
 FLIGHT_AGENT_PROMPT = """
-You are a travel flight expert.
+You are the flight research agent for Voyanta.
 
-User Query:
+User query:
 {query}
 
-Airport Information:
+Trip constraints extracted by the supervisor:
+{constraints}
+
+Data retrieved from AviationStack (this is the ONLY verified data you have):
+
+Airport data status: {airport_status}
+Airport data:
 {airport_data}
 
-Airline Information:
+Airline data status: {airline_status}
+Airline data:
 {airline_data}
 
-Generate:
+Rules:
+- Use ONLY the data above as verified facts. The airport/airline lists are general
+  reference data, not live schedules for this route.
+- Do NOT invent flight numbers, schedules, departure/arrival times, prices,
+  fares, seat availability, or which airlines operate this exact route.
+- If a data status says UNAVAILABLE, say plainly that this part of the flight
+  data source could not be retrieved. Do not fill the gap with guesses.
+- You may list airports (name, IATA/ICAO code, city, country) or airlines that
+  appear in the data and clearly match the origin or destination city/country.
+  Preserve every useful field shown for them.
+- If nothing in the data matches the route, say so.
+- You may add clearly labelled general guidance (e.g. "general knowledge, not
+  verified by the data source") such as which city airports are commonly used,
+  but never present it as verified data and never give prices.
 
-1. Likely departure airport
-2. Likely arrival airport
-3. Airlines serving this route
-4. Typical flight duration
-5. Estimated airfare range
-6. Peak season pricing warning
-7. Booking advice
-
-Return concise travel guidance.
+Output Markdown with these parts (omit a part if there is nothing to say):
+**Verified data** - matching airports/airlines with all available fields.
+**Not available** - what the flight data source could not provide.
+**General guidance (unverified)** - brief, clearly labelled.
 """
-
-
 
 
 # Flight Agent
@@ -373,27 +854,76 @@ Return concise travel guidance.
 def flight_agent(state: TravelState):
     print("\nINSIDE FLIGHT AGENT\n")
     query = state["user_query"]
+    constraints = state.get("trip_constraints", {})
 
     try:
-        airports = asyncio.run(aviation_mcp_call("list_airports"))
-        airlines = asyncio.run(aviation_mcp_call("list_airlines"))
+        airports_text = ""
+        airlines_text = ""
+        airport_error = ""
+        airline_error = ""
 
-        print("\nAIRPORTS:", airports)
-        print("\nAIRLINES:", airlines)
+        try:
+            airports = asyncio.run(aviation_mcp_call("list_airports"))
+            airports_text = _data_to_text(airports)
+            if _looks_like_api_error(airports_text):
+                airport_error = _short_api_error(airports_text)
+        except Exception as exc:
+            airport_error = f"{type(exc).__name__}: {exc}"
+
+        try:
+            airlines = asyncio.run(aviation_mcp_call("list_airlines"))
+            airlines_text = _data_to_text(airlines)
+            if _looks_like_api_error(airlines_text):
+                airline_error = _short_api_error(airlines_text)
+        except Exception as exc:
+            airline_error = f"{type(exc).__name__}: {exc}"
+
+        print("\nAIRPORTS:", airports_text[:500])
+        print("\nAIRLINES:", airlines_text[:500])
+
+        if airport_error and airline_error:
+            # Nothing verified is available - do NOT call the LLM, do NOT invent anything.
+            reason = airport_error if airport_error == airline_error else f"{airport_error} / {airline_error}"
+            flight_data = (
+                "Flight data unavailable: the flight data source (AviationStack) "
+                f"rejected the request ({reason}). "
+                "No flight numbers, airlines, schedules or fares are shown because "
+                "they could not be verified."
+            )
+            return {
+                "flight_results": flight_data,
+                "messages": [AIMessage(content="Flight data source unavailable")],
+            }
 
         prompt = FLIGHT_AGENT_PROMPT.format(
             query=query,
-            airport_data=str(airports)[:3000],
-            airline_data=str(airlines)[:3000],
+            constraints=constraints,
+            airport_status=(
+                f"UNAVAILABLE ({airport_error})" if airport_error else "OK"
+            ),
+            airport_data=(
+                "None" if airport_error else airports_text[:3000]
+            ),
+            airline_status=(
+                f"UNAVAILABLE ({airline_error})" if airline_error else "OK"
+            ),
+            airline_data=(
+                "None" if airline_error else airlines_text[:3000]
+            ),
         )
 
         response = llm.invoke(
             [
-                SystemMessage(content="You are an expert travel flight planner."),
+                SystemMessage(
+                    content=(
+                        "You are a careful flight research agent. "
+                        "You never invent flight data."
+                    )
+                ),
                 HumanMessage(content=prompt),
             ]
         )
-        flight_data = response.content
+        flight_data = _content_to_text(response.content)
     except Exception as exc:
         flight_data = f"Flight information unavailable: {exc}"
 
@@ -442,80 +972,34 @@ Destination:
 {destination}
 
 Station search results for origin:
-{origin_search}
+{_data_to_text(origin_search)}
 
 Station search results for destination:
-{destination_search}
+{_data_to_text(destination_search)}
 
-Determine the railway stations most likely to have direct
-intercity train routes for this journey.
+Determine the railway stations most likely to serve this journey.
 
-Return exactly 2 candidate stations for each location.
+Return at most 2 candidate stations for each location.
 
-For Kolkata, prioritize:
-- Howrah Junction (HWH)
-- Sealdah (SDAH)
-- Kolkata Terminal (KOAA)
-
-For Delhi, prioritize:
-- New Delhi (NDLS)
-- Delhi Junction (DLI)
-- Anand Vihar Terminal (ANVT)
-
-Return only station codes that are present in the provided
-station search results or are standard Indian railway station codes.
-
-Important:
-- Prefer major railway stations.
-- Prefer stations belonging to the requested city or metropolitan area.
-- Use station codes present in the search results whenever possible.
-- Do not invent station codes.
+Rules:
+- Prefer major intercity railway stations serving the requested city or metropolitan area.
+- Prefer station codes that appear in the supplied station-search results.
+- A station must be geographically and semantically appropriate for the requested city.
+- Do not select a similarly named station in another city just because its name matches.
+- Do not invent station codes when the search evidence does not support them.
 - Order candidates from most appropriate to least appropriate.
-- These candidates will be independently verified using RailRadar.
-
-Return ONLY JSON.
-
-Format:
-{{
-    "origin_candidates": [
-        {{
-            "station": "",
-            "code": ""
-        }}
-    ],
-    "destination_candidates": [
-        {{
-            "station": "",
-            "code": ""
-        }}
-    ]
-}}
+- These are candidate codes only. RailRadar verification is the source of truth.
+- Never claim that a route exists until RailRadar returns trains for the candidate pair.
 """
 
-        station_response = _llm_text(
+        station_data = _llm_structured(
             "You are a railway location reasoning agent for Voyanta.",
             station_prompt,
+            StationSelection,
         )
 
-        try:
-            station_data = json.loads(station_response)
-        except json.JSONDecodeError:
-            return {
-                "train_results": (
-                    "Train station resolution failed because the "
-                    "LLM returned invalid JSON."
-                )
-            }
-
-        origin_candidates = station_data.get(
-            "origin_candidates",
-            []
-        )
-
-        destination_candidates = station_data.get(
-            "destination_candidates",
-            []
-        )
+        origin_candidates = [c.model_dump() for c in station_data.origin_candidates]
+        destination_candidates = [c.model_dump() for c in station_data.destination_candidates]
 
         if not origin_candidates or not destination_candidates:
             return {
@@ -545,7 +1029,7 @@ Format:
                     )
                 )
 
-                result_text = str(train_result)
+                result_text = _data_to_text(train_result)
 
                 if (
                     "trains" in result_text.lower()
@@ -554,7 +1038,7 @@ Format:
                     verified_route = {
                         "origin": origin_candidate,
                         "destination": destination_candidate,
-                        "result": train_result,
+                        "result": result_text,
                     }
                     break
 
@@ -586,61 +1070,41 @@ User request:
 Verified route:
 {origin_station} ({origin_code}) -> {destination_station} ({destination_code})
 
-RailRadar data:
-{train_result}
+RailRadar data (the ONLY source of truth):
+{train_result[:20000]}
 
-Return ONLY valid JSON.
-
-Format:
-{{
-    "origin_station": "",
-    "origin_code": "",
-    "destination_station": "",
-    "destination_code": "",
-    "trains": [
-        {{
-            "number": "",
-            "name": "",
-            "type": "",
-            "departure": "",
-            "arrival": "",
-            "duration": "",
-            "distance_km": "",
-            "running_days": ""
-        }}
-    ]
-}}
+Extract the trains from the RailRadar data into the schema.
 
 Rules:
-- Include at most 5 trains.
-- Use ONLY information from RailRadar data.
-- Do not invent information.
-- Do not include fares.
-- Do not include seat availability.
-- Do not include booking advice.
-- Do not include recommendations.
-- Do not include explanations.
-- Do not include Markdown.
-- Return JSON only.
+- Include at most 8 trains.
+- Use ONLY information present in the RailRadar data.
+- Copy train number, name, type, departure, arrival, duration, distance and
+  running days exactly as provided. If a field is missing, leave it empty.
+- Do not invent or estimate any value.
+- Do not include fares, seat availability, booking advice or recommendations.
 """
 
-        response = _llm_text(
-            "You are the Train Research Agent for Voyanta.",
+        summary = _llm_structured(
+            "You are the Train Research Agent for Voyanta. You only copy verified data.",
             summary_prompt,
-)
+            TrainSummary,
+        )
 
-        try:
-            train_data = json.loads(response)
-        except json.JSONDecodeError:
-            return {
-        "train_results": {
-            "error": "Train agent returned invalid JSON."
+        # Station names/codes come from the verified RailRadar route, not from the LLM.
+        train_data = {
+            "origin_station": origin_station,
+            "origin_code": origin_code,
+            "destination_station": destination_station,
+            "destination_code": destination_code,
+            "trains": [t.model_dump() for t in summary.trains],
+            "data_source": "RailRadar",
         }
-    }
 
         return {
-    "train_results": train_data,
-}
+            "train_results": train_data,
+            "messages": [AIMessage(content="Train information verified.")],
+            "llm_calls": state.get("llm_calls", 0) + 2,
+        }
     except Exception as exc:
         return {
             "train_results": (
@@ -649,30 +1113,85 @@ Rules:
         }
 
 
+HOTEL_EXTRACT_PROMPT = """
+Extract hotel details from the web search results below.
+
+Trip constraints:
+{constraints}
+
+Search results (the ONLY source of truth):
+{raw_text}
+
+Rules:
+- Return up to 10 real hotels/properties whose names appear in the text.
+  Do NOT return listing-page titles such as "10 BEST Hotels in ..." as hotels.
+- Prefer a spread of budget, mid-range and premium options when the text allows it.
+- price_per_night: copy exactly as written, including the currency symbol
+  (e.g. "₹2,499" or "from ₪21"). Do NOT convert currencies and do NOT estimate.
+  Leave empty if no price is stated for that hotel.
+- rating, area, category and highlights: copy only what the text states; otherwise leave empty.
+- source_url / source_title: the page the hotel information came from (URLs appear in the text).
+- price_note: one short line if the prices are in mixed currencies or only "starting from" prices.
+- Never invent hotels, prices, ratings or links.
+"""
+
+
 def hotel_agent(state: TravelState):
-    query = (
-        f"Best hotels for "
-        f"{state['user_query']}"
-    )
+    constraints = state.get("trip_constraints", {})
+    hotel_destination = constraints.get("destination")
 
-    try:
-        hotel_results = asyncio.run(
-            tavily_mcp_search(query)
-        )
+    if hotel_destination:
+        queries = [
+            f"best hotels in {hotel_destination} price per night in INR ₹ rating",
+            f"budget and mid-range hotels in {hotel_destination} price per night ₹",
+        ]
+    else:
+        queries = [f"Best hotels for {state['user_query']}"]
 
-    except Exception as exc:
-        print(
-            f"HOTEL AGENT MCP ERROR: "
-            f"{type(exc).__name__}: {exc}",
-            flush=True,
-        )
+    raw_chunks: list[str] = []
+    for search_query in queries:
+        try:
+            raw_chunks.append(
+                _data_to_text(asyncio.run(tavily_mcp_search(search_query)))
+            )
+        except Exception as exc:
+            print(
+                f"HOTEL AGENT MCP ERROR: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
 
+    llm_calls = state.get("llm_calls", 0)
+
+    if not raw_chunks:
         hotel_results = (
-            "Live hotel search is temporarily unavailable. "
-            "Provide general accommodation and neighborhood "
-            "guidance based on the destination and clearly "
-            "label it as non-live advice."
+            "Live hotel search is temporarily unavailable, so no hotel "
+            "names, prices or ratings could be retrieved."
         )
+    else:
+        raw_text = "\n\n".join(raw_chunks)
+        try:
+            summary = _llm_structured(
+                "You extract hotel facts from search results and never invent data.",
+                HOTEL_EXTRACT_PROMPT.format(
+                    constraints=constraints,
+                    raw_text=raw_text[:24000],
+                ),
+                HotelSummary,
+            )
+            hotels = [h.model_dump() for h in summary.hotels]
+            llm_calls += 1
+
+            if hotels:
+                hotel_results = json.dumps(
+                    {"hotels": hotels, "price_note": summary.price_note},
+                    ensure_ascii=False,
+                )
+            else:
+                hotel_results = raw_text[:6000]
+        except Exception as exc:
+            print(f"HOTEL EXTRACTION ERROR: {type(exc).__name__}: {exc}", flush=True)
+            hotel_results = raw_text[:6000]
 
     return {
         "hotel_results": hotel_results,
@@ -681,9 +1200,7 @@ def hotel_agent(state: TravelState):
                 content="Hotel information processed."
             )
         ],
-        "llm_calls": (
-            state.get("llm_calls", 0) + 1
-        ),
+        "llm_calls": llm_calls,
     }
 
 
@@ -691,7 +1208,8 @@ def hotel_agent(state: TravelState):
 
 
 def weather_agent(state: TravelState):
-    city = extract_destination(
+    constraints = state.get("trip_constraints", {})
+    city = constraints.get("destination") or extract_destination(
         state["user_query"]
     )
 
@@ -704,13 +1222,14 @@ def weather_agent(state: TravelState):
             forecast_mcp_search(city)
         )
 
-        weather_results = f"""
-Current Weather:
-{weather_data}
-
-Forecast:
-{forecast_data}
-"""
+        weather_results = json.dumps(
+            {
+                "city": city,
+                "current": _maybe_json(_data_to_text(weather_data)),
+                "forecast": _maybe_json(_data_to_text(forecast_data)),
+            },
+            ensure_ascii=False,
+        )
 
     except Exception as exc:
         print(
@@ -721,9 +1240,8 @@ Forecast:
 
         weather_results = (
             f"Live weather information for {city} "
-            "is temporarily unavailable. Give general "
-            "seasonal guidance and advise the traveler "
-            "to verify the forecast before departure."
+            "is temporarily unavailable. Verify the forecast "
+            "before departure."
         )
 
     return {
@@ -740,41 +1258,55 @@ Forecast:
 
 def budget_agent(state: TravelState):
     prompt = f"""
-Analyze whether this trip is realistic for the user's budget.
+Create a practical budget breakdown for this trip.
 
 User Query:
 {state['user_query']}
 
-Trip Constraints:
+Trip Constraints (only what the user stated):
 {state.get('trip_constraints', {})}
 
 Flight Results:
-{state.get('flight_results', '')}
+{state.get('flight_results', '') or 'Not requested / not run'}
+
+Train Results (RailRadar - verified schedules, no fares included):
+{_data_to_text(state.get('train_results', '')) or 'Not requested / not run'}
 
 Hotel Results:
-{state.get('hotel_results', '')}
+{state.get('hotel_results', '') or 'Not requested / not run'}
 
 Weather Results:
-{state.get('weather_results', '')}
+{state.get('weather_results', '') or 'Not requested / not run'}
 
-Return:
-1. Estimated cost categories
-2. Budget risk areas
-3. Money-saving suggestions
-4. Overall feasibility
+Produce a Markdown budget with these parts:
+1. Budget table with rows for: transportation (to and from), accommodation,
+   food, local transportation, activities/sightseeing, and estimated total.
+   Add a column "Basis" that says either "Verified" (the price appears in the
+   data above) or "Estimate" (your approximate figure).
+2. Budget feasibility versus the user's stated budget (if none was stated, say so).
+3. Main budget risks.
+4. Money-saving suggestions.
 
-If exact live prices are unavailable, clearly label estimates as approximate.
+Rules:
+- Train and flight tools above do NOT provide fares. Never present a fare as
+  verified. Give a rough range labelled "Estimate" and say it should be
+  confirmed on the booking platform.
+- Only mark a hotel price "Verified" if it literally appears in the hotel results.
+- Scale the estimates to the number of travelers and days if they were stated;
+  if not stated, say which assumption you used.
+- If flight data was unavailable, say so and do not estimate flight details.
+- Keep it compact and clear.
 """
 
     response = llm.invoke(
         [
-            SystemMessage(content="You are a practical travel budget analyst."),
+            SystemMessage(content="You are a practical travel budget analyst. You clearly separate verified prices from estimates."),
             HumanMessage(content=prompt),
         ]
     )
 
     return {
-        "budget_results": response.content,
+        "budget_results": _content_to_text(response.content),
         "messages": [AIMessage(content="Budget assessment generated.")],
         "llm_calls": state.get("llm_calls", 0) + 1,
     }
@@ -785,28 +1317,28 @@ If exact live prices are unavailable, clearly label estimates as approximate.
 
 def itinerary_agent(state: TravelState):
     prompt = f"""
-Create a concise day-by-day travel itinerary.
+Create a destination-specific day-by-day travel itinerary.
 
 User Query:
 {state['user_query']}
 
-Trip Constraints:
+Trip Constraints (only what the user stated):
 {state.get('trip_constraints', {})}
 
 Flight Information:
-{state.get('flight_results', '')}
+{state.get('flight_results', '') or 'Not requested / not run'}
 
-Train Information:
-{state.get('train_results', {})}
+Train Information (RailRadar verified):
+{_data_to_text(state.get('train_results', '')) or 'Not requested / not run'}
 
 Hotel Information:
-{state.get('hotel_results', '')}
+{state.get('hotel_results', '') or 'Not requested / not run'}
 
 Weather Information:
-{state.get('weather_results', '')}
+{state.get('weather_results', '') or 'Not requested / not run'}
 
 Budget Information:
-{state.get('budget_results', '')}
+{state.get('budget_results', '') or 'Not requested / not run'}
 
 Create ONLY the day-by-day itinerary.
 
@@ -814,30 +1346,25 @@ For each day include:
 - Morning
 - Afternoon
 - Evening
-- Important travel/transfer times when relevant
-- Main activities and places
+- Travel/transfer timing when relevant
+- Named places and activities
 
 Rules:
-- Keep each day concise.
-- Do not create a separate flight section.
-- Do not create a separate train section.
-- Do not create a booking guide.
-- Do not explain how to book tickets.
-- Do not mention IRCTC or external booking websites.
-- Do not create safety tips.
-- Do not create food hygiene advice.
-- Do not create packing advice.
-- Do not create women traveler advice.
-- Do not create generic travel tips.
-- Do not create a "Sample Day-by-Day Narrative".
-- Do not repeat complete flight or train details.
-- Use the verified flight/train information only when necessary for
-  scheduling the day.
-- Do not invent specific booking availability.
-- Do not invent ticket prices.
-- Do not invent train or flight numbers.
-- Do not add information unrelated to the itinerary.
-- Keep the entire itinerary concise and easy to scan.
+- Use the requested number of days. If the duration was not stated, choose a
+  sensible length and say so in one line.
+- Use real, well-known places and areas of the destination (monuments,
+  markets, neighbourhoods, food areas). Do not write generic lines such as
+  "Explore the city".
+- Group nearby places on the same day to reduce travel time.
+- Day 1 and the last day should account for travel time; use the verified
+  train/flight timings above only when they are actually provided.
+- Use weather information to place outdoor/indoor activities when available.
+- If specific hotels were found, you may mention where the traveler stays.
+- Do NOT invent train/flight numbers, ticket prices, opening hours or
+  availability.
+- Keep each day concise and easy to scan.
+- Do not repeat full train/flight details, and do not add booking guides,
+  packing lists or generic safety tips.
 
 The output should contain only the day-by-day itinerary.
 """
@@ -845,7 +1372,7 @@ The output should contain only the day-by-day itinerary.
     response = llm.invoke(
         [
             SystemMessage(
-                content="You are a concise travel itinerary planner."
+                content="You are an expert destination-specific travel itinerary planner."
             ),
             HumanMessage(content=prompt),
         ]
@@ -858,7 +1385,7 @@ The output should contain only the day-by-day itinerary.
     )
 
     return {
-        "itinerary": response.content,
+        "itinerary": _content_to_text(response.content),
         "approval_request": approval_request,
         "messages": [
             AIMessage(
@@ -914,7 +1441,7 @@ The user requested a revision. Apply this feedback carefully:
 """
 
     final_prompt = f"""
-Generate the final travel response for the user.
+Write the final travel plan for the user in Markdown.
 
 Human Review:
 {review_instruction}
@@ -922,53 +1449,86 @@ Human Review:
 User Request:
 {state['user_query']}
 
-Supervisor Constraints:
+Supervisor Constraints (only what the user stated):
 {state.get('trip_constraints', {})}
 
-Flights:
-{state.get('flight_results', '')}
+Agents that ran:
+{state.get('selected_agents', [])}
 
-Hotels:
-{state.get('hotel_results', '')}
+=== FLIGHT DATA (AviationStack) ===
+{state.get('flight_results', '') or 'Not run'}
 
-Weather:
-{state.get('weather_results', '')}
+=== TRAIN DATA (RailRadar verified, structured) ===
+{_data_to_text(state.get('train_results', '')) or 'Not run'}
 
-Budget Analysis:
-{state.get('budget_results', '')}
+=== HOTEL DATA ===
+{state.get('hotel_results', '') or 'Not run'}
 
-Draft Itinerary:
+=== WEATHER DATA ===
+{state.get('weather_results', '') or 'Not run'}
+
+=== BUDGET ANALYSIS ===
+{state.get('budget_results', '') or 'Not run'}
+
+=== DRAFT ITINERARY ===
 {state.get('itinerary', '')}
 
-Format the final answer beautifully using these sections:
-1. Trip Summary
-2. Flight Information
-3. Hotel Suggestions
-4. Weather Information
-5. Day-by-Day Itinerary
-6. Estimated Budget
-7. Final Recommendations
+Use these sections, and include a section ONLY if it has relevant information:
 
-Important:
-- Be clear and practical.
-- Mention that live flight APIs may not provide ticket prices when pricing is unavailable.
-- Include weather-based travel advice.
-- Keep the response useful for real travel planning.
-- Incorporate the human feedback when revision was requested.
+# Trip Summary
+Origin, destination, duration, travelers, budget and preferences the user actually stated.
+
+# Transportation
+## Trains
+For every train in the data show: number, name, type, origin station and code,
+destination station and code, departure, arrival, duration, distance and
+running days. Use a table when there are several trains. Only include fields
+that exist.
+## Flights
+Show verified airport/airline details that are present. If the flight data says
+it is unavailable or failed, state clearly that flight information could not be
+retrieved from the flight data source. Do not add flight numbers, schedules or
+prices of your own.
+
+# Hotels
+A table with: Hotel, Area, Rating, Price per night (exactly as listed, with its currency; write "Not listed" if missing), Highlights, and a source link. Do not convert currencies or estimate prices. If hotel search failed, say so and give only clearly labelled general area advice.
+
+# Weather
+Temperature, condition, humidity, forecast and other fields actually provided,
+plus short weather-based advice.
+
+# Budget
+The breakdown from the budget analysis, keeping the distinction between
+verified prices and estimates.
+
+# Itinerary
+The day-by-day plan, incorporating the human review instruction above.
+
+Rules:
+- Do not invent train/flight numbers, times, prices, hotel details or weather values.
+- If a tool failed or was not available, say so plainly instead of filling the gap.
+- Do not drop useful tool fields, and do not repeat the same information in several sections.
+- Do not include a section for an agent that did not run.
+- Be clear, practical and specific to the destination.
 """
 
     response = llm.invoke(
         [
             SystemMessage(
-                content="You are a professional AI travel booking assistant."
+                content=(
+                    "You are a professional AI travel planner. You only present "
+                    "verified tool data as fact and clearly label estimates."
+                )
             ),
             HumanMessage(content=final_prompt),
         ]
     )
 
+    final_text = _content_to_text(response.content).strip() or state.get("itinerary", "")
+
     return {
-        "final_response": response.content,
-        "messages": [response],
+        "final_response": final_text,
+        "messages": [AIMessage(content=final_text)],
         "llm_calls": state.get("llm_calls", 0) + 1,
     }
 
@@ -1087,33 +1647,37 @@ def _serialize_result(
     thread_id: str,
 ) -> dict[str, Any]:
     messages = result.get("messages", [])
-    last_message = messages[-1].content if messages else ""
+    last_message = _content_to_text(messages[-1].content) if messages else ""
     answer = result.get("final_response") or last_message
     interrupt_payload = _interrupt_payload(result)
 
     if interrupt_payload:
-        answer = interrupt_payload.get("draft_itinerary") or result.get(
-            "itinerary", ""
-        )
+        answer = _build_plan_preview(result)
 
-    return {
+    # The assistant answer must always be a plain string for the frontend Markdown renderer.
+    answer = _content_to_text(answer)
+
+    draft_itinerary = _content_to_text(
+        interrupt_payload.get("draft_itinerary", "")
+        if interrupt_payload
+        else result.get("itinerary", "")
+    )
+
+    payload = {
         "thread_id": thread_id,
         "answer": answer,
         "requires_approval": interrupt_payload is not None,
-        "approval_request": (
+        "approval_request": _content_to_text(
             interrupt_payload.get("approval_request", "")
             if interrupt_payload
             else result.get("approval_request", "")
         ),
-        "flight_results": result.get("flight_results", ""),
-        "hotel_results": result.get("hotel_results", ""),
-        "weather_results": result.get("weather_results", ""),
-        "budget_results": result.get("budget_results", ""),
-        "itinerary": (
-            interrupt_payload.get("draft_itinerary", "")
-            if interrupt_payload
-            else result.get("itinerary", "")
-        ),
+        "flight_results": _data_to_text(result.get("flight_results", "")),
+        "train_results": result.get("train_results", ""),
+        "hotel_results": _data_to_text(result.get("hotel_results", "")),
+        "weather_results": _data_to_text(result.get("weather_results", "")),
+        "budget_results": _content_to_text(result.get("budget_results", "")),
+        "itinerary": draft_itinerary,
         "selected_agents": result.get("selected_agents", []),
         "trip_constraints": result.get("trip_constraints", {}),
         "supervisor_reasoning": result.get("supervisor_reasoning", ""),
@@ -1123,6 +1687,8 @@ def _serialize_result(
         "human_feedback": result.get("human_feedback", ""),
         "llm_calls": result.get("llm_calls", 0),
     }
+
+    return _json_safe(payload)
 
 
 def run_travel_agent(
@@ -1202,4 +1768,3 @@ def resume_travel_agent(
         result,
         thread_id,
     )
-

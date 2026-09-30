@@ -23,36 +23,37 @@ AVIATION_STACK_API_KEY = (
 )
 
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
+RAILRADAR_API_KEY = os.getenv("RAILRADAR_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-RAILRADAR_API_KEY = os.getenv("RAILRADAR_API_KEY")
-
 WEATHER_SERVER_PATH = BASE_DIR / "weather_mcp_custom.py"
+TRAIN_SERVER_PATH = BASE_DIR / "train_mcp.py"
 UVX_COMMAND = shutil.which("uvx") or "uvx"
+
 
 
 def _require_env(name: str, value: str | None) -> str:
     if not value:
         raise RuntimeError(
-            f"{name} is missing. "
-            f"Add {name}=your_key to the project .env file."
+            f"{name} is missing. Add {name}=your_key to the project .env file."
         )
     return value
 
 
+
 def _subprocess_env(**updates: str | None) -> dict[str, str]:
     env = os.environ.copy()
-
     for key, value in updates.items():
         if value:
             env[key] = value
-
     return env
 
 
 llm = ChatGroq(
     model="openai/gpt-oss-120b",
     api_key=_require_env("GROQ_API_KEY", GROQ_API_KEY),
+    temperature=0.2,
+    max_retries=2,
 )
 
 
@@ -60,17 +61,12 @@ client = MultiServerMCPClient(
     {
         "tavily": {
             "transport": "streamable_http",
-            "url": (
-                "https://mcp.tavily.com/mcp/"
-                f"?tavilyApiKey={TAVILY_API_KEY or ''}"
-            ),
+            "url": f"https://mcp.tavily.com/mcp/?tavilyApiKey={TAVILY_API_KEY or ''}",
         },
         "aviationstack": {
             "transport": "stdio",
             "command": UVX_COMMAND,
-            "args": [
-                "aviationstack-mcp",
-            ],
+            "args": ["aviationstack-mcp"],
             "env": _subprocess_env(
                 AVIATION_STACK_API_KEY=AVIATION_STACK_API_KEY,
             ),
@@ -78,99 +74,62 @@ client = MultiServerMCPClient(
         "weather": {
             "transport": "stdio",
             "command": sys.executable,
-            "args": [
-                str(WEATHER_SERVER_PATH),
-            ],
+            "args": [str(WEATHER_SERVER_PATH)],
             "env": _subprocess_env(
                 OPENWEATHER_API_KEY=OPENWEATHER_API_KEY,
             ),
         },
-
         "train": {
-    "transport": "stdio",
-    "command": sys.executable,
-    "args": [
-        str(BASE_DIR / "train_mcp.py"),
-    ],
-    "env": _subprocess_env(
-        RAILRADAR_API_KEY=RAILRADAR_API_KEY,
-    ),
-},
+            "transport": "stdio",
+            "command": sys.executable,
+            "args": [str(TRAIN_SERVER_PATH)],
+            "env": _subprocess_env(
+                RAILRADAR_API_KEY=RAILRADAR_API_KEY,
+            ),
+        },
     }
 )
 
 
-async def _get_server_tool(
-    server_name: str,
-    tool_name: str,
-):
+async def _get_server_tool(server_name: str, tool_name: str):
     if server_name == "tavily":
-        _require_env(
-            "TAVILY_API_KEY",
-            TAVILY_API_KEY,
-        )
+        _require_env("TAVILY_API_KEY", TAVILY_API_KEY)
 
     elif server_name == "aviationstack":
-        _require_env(
-            "AVIATION_STACK_API_KEY",
-            AVIATION_STACK_API_KEY,
-        )
-
+        _require_env("AVIATION_STACK_API_KEY", AVIATION_STACK_API_KEY)
         if shutil.which("uvx") is None:
             raise RuntimeError(
                 "uvx was not found. Install uv, reopen the terminal, "
-                "activate the travel environment, and run "
-                "`uvx --version`."
+                "activate the travel environment, and run `uvx --version`."
             )
 
     elif server_name == "weather":
-        _require_env(
-            "OPENWEATHER_API_KEY",
-            OPENWEATHER_API_KEY,
-        )
-
+        _require_env("OPENWEATHER_API_KEY", OPENWEATHER_API_KEY)
         if not WEATHER_SERVER_PATH.is_file():
             raise FileNotFoundError(
-                f"Weather MCP server not found: "
-                f"{WEATHER_SERVER_PATH}"
+                f"Weather MCP server not found: {WEATHER_SERVER_PATH}"
             )
 
-        elif server_name == "train":
-            _require_env(
-            "RAILRADAR_API_KEY",
-            RAILRADAR_API_KEY,
-        )
-
-        if not (BASE_DIR / "train_mcp.py").is_file():
+    elif server_name == "train":
+        _require_env("RAILRADAR_API_KEY", RAILRADAR_API_KEY)
+        if not TRAIN_SERVER_PATH.is_file():
             raise FileNotFoundError(
-            f"Train MCP server not found: "
-            f"{BASE_DIR / 'train_mcp.py'}"
-        )
+                f"Train MCP server not found: {TRAIN_SERVER_PATH}"
+            )
 
-    tools = await client.get_tools(
-        server_name=server_name,
-    )
+    tools = await client.get_tools(server_name=server_name)
 
     tool = next(
-        (
-            item
-            for item in tools
-            if item.name == tool_name
-        ),
+        (item for item in tools if item.name == tool_name),
         None,
     )
 
     if tool is None:
-        available_tools = (
-            ", ".join(
-                sorted(item.name for item in tools)
-            )
-            or "none"
-        )
-
+        available_tools = ", ".join(
+            sorted(item.name for item in tools)
+        ) or "none"
         raise RuntimeError(
-            f"MCP tool '{tool_name}' was not found "
-            f"on server '{server_name}'. "
+            f"MCP tool '{tool_name}' was not found on server '{server_name}'. "
             f"Available tools: {available_tools}"
         )
 
@@ -178,100 +137,45 @@ async def _get_server_tool(
 
 
 async def get_all_tools() -> None:
-    for server_name in (
-        "tavily",
-        "aviationstack",
-        "weather",
-        "train",
-    ):
+    for server_name in ("tavily", "aviationstack", "weather", "train"):
         try:
-            tools = await client.get_tools(
-                server_name=server_name,
-            )
-
-            tool_names = (
-                ", ".join(
-                    tool.name
-                    for tool in tools
-                )
-                or "no tools"
-            )
-
-            print(
-                f"{server_name}: OK -> {tool_names}"
-            )
-
+            tools = await client.get_tools(server_name=server_name)
+            tool_names = ", ".join(tool.name for tool in tools) or "no tools"
+            print(f"{server_name}: OK -> {tool_names}", flush=True)
         except Exception as exc:
             print(
-                f"{server_name}: FAILED -> "
-                f"{type(exc).__name__}: {exc}"
+                f"{server_name}: FAILED -> {type(exc).__name__}: {exc}",
+                flush=True,
             )
 
 
 async def tavily_mcp_search(query: str):
-    search_tool = await _get_server_tool(
-        "tavily",
-        "tavily_search",
-    )
-
-    return await search_tool.ainvoke(
-        {
-            "query": query,
-        }
-    )
+    search_tool = await _get_server_tool("tavily", "tavily_search")
+    return await search_tool.ainvoke({"query": query})
 
 
 async def aviation_mcp_call(
     tool_name: str,
     tool_args: dict[str, Any] | None = None,
 ):
-    aviation_tool = await _get_server_tool(
-        "aviationstack",
-        tool_name,
-    )
-
-    return await aviation_tool.ainvoke(
-        tool_args or {}
-    )
+    aviation_tool = await _get_server_tool("aviationstack", tool_name)
+    return await aviation_tool.ainvoke(tool_args or {})
 
 
 async def weather_mcp_search(city: str):
-    weather_tool = await _get_server_tool(
-        "weather",
-        "get_current_weather",
-    )
-
-    return await weather_tool.ainvoke(
-        {
-            "city": city,
-        }
-    )
+    weather_tool = await _get_server_tool("weather", "get_current_weather")
+    return await weather_tool.ainvoke({"city": city})
 
 
 async def forecast_mcp_search(city: str):
-    forecast_tool = await _get_server_tool(
-        "weather",
-        "get_forecast",
-    )
-
-    return await forecast_tool.ainvoke(
-        {
-            "city": city,
-        }
-    )
+    forecast_tool = await _get_server_tool("weather", "get_forecast")
+    return await forecast_tool.ainvoke({"city": city})
 
 
 async def train_station_search(query: str):
-    station_tool = await _get_server_tool(
-        "train",
-        "search_stations",
-    )
+    station_tool = await _get_server_tool("train", "search_stations")
+    return await station_tool.ainvoke({"query": query})
 
-    return await station_tool.ainvoke(
-        {
-            "query": query,
-        }
-    )
 
 async def train_mcp_search(
     from_location: str,
@@ -279,11 +183,7 @@ async def train_mcp_search(
     date: str = "",
     by_city: bool = True,
 ):
-    train_tool = await _get_server_tool(
-        "train",
-        "search_trains",
-    )
-
+    train_tool = await _get_server_tool("train", "search_trains")
     return await train_tool.ainvoke(
         {
             "from_location": from_location,
@@ -294,26 +194,55 @@ async def train_mcp_search(
     )
 
 
+
+def _content_to_text(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        if isinstance(content.get("text"), str):
+            return content["text"]
+        if isinstance(content.get("content"), (str, list, dict)):
+            return _content_to_text(content["content"])
+        return str(content)
+    if isinstance(content, (list, tuple)):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+            else:
+                text = getattr(item, "text", None)
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+    text = getattr(content, "text", None)
+    return text if isinstance(text, str) else str(content)
+
+
+
 def extract_destination(query: str) -> str:
-    prompt = f"""
-Extract only the destination city or country from the travel request.
+    response = llm.invoke(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "Extract only the destination city or country from the travel request. "
+                    "Return only the destination name and nothing else."
+                ),
+            },
+            {
+                "role": "user",
+                "content": query,
+            },
+        ]
+    )
 
-Travel request:
-{query}
-
-Return only the destination name.
-Do not add any explanation.
-"""
-
-    response = llm.invoke(prompt)
-
-    destination = str(
-        response.content
-    ).strip()
+    destination = _content_to_text(response.content).strip()
 
     if not destination:
-        raise ValueError(
-            "The destination could not be extracted."
-        )
+        raise ValueError("The destination could not be extracted.")
 
     return destination

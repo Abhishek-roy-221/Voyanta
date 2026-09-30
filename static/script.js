@@ -40,12 +40,127 @@ function hideError() {
 function renderMarkdown(element, content) {
     if (!element) return;
 
+    // Always coerce to a string so marked() never receives an array/object.
+    let text = content;
+    if (Array.isArray(text)) {
+        text = text
+            .map(block => (typeof block === "string" ? block : (block && block.text) || ""))
+            .join("");
+    } else if (text && typeof text === "object") {
+        text = text.text || JSON.stringify(text, null, 2);
+    }
+    text = typeof text === "string" ? text : String(text ?? "");
+
     if (typeof marked !== "undefined") {
-        element.innerHTML = marked.parse(content || "");
+        element.innerHTML = marked.parse(text);
     } else {
-        element.innerText = content || "";
+        element.innerText = text;
     }
 }
+
+/* ---------- Pre-approval preview builder ---------- */
+
+function isEmptyValue(value) {
+    if (value === null || value === undefined) return true;
+    if (typeof value === "string") return !value.trim();
+    if (Array.isArray(value)) return value.length === 0;
+    if (typeof value === "object") return Object.keys(value).length === 0;
+    return false;
+}
+
+function escapeCell(value) {
+    const text = String(value ?? "").replace(/\|/g, "\\|").replace(/\n/g, " ").trim();
+    return text || "-";
+}
+
+function formatTrains(trainResults) {
+    if (isEmptyValue(trainResults)) return "";
+
+    // Error / status message from the backend
+    if (typeof trainResults === "string") {
+        return `## Trains\n\n${trainResults}\n`;
+    }
+
+    const trains = Array.isArray(trainResults.trains) ? trainResults.trains : [];
+    let md = "## Trains\n\n";
+
+    const origin = [trainResults.origin_station, trainResults.origin_code ? `(${trainResults.origin_code})` : ""]
+        .filter(Boolean).join(" ");
+    const destination = [trainResults.destination_station, trainResults.destination_code ? `(${trainResults.destination_code})` : ""]
+        .filter(Boolean).join(" ");
+
+    if (origin || destination) {
+        md += `**Verified route:** ${origin || "-"} → ${destination || "-"}`;
+        if (trainResults.data_source) md += ` · Source: ${trainResults.data_source}`;
+        md += "\n\n";
+    }
+
+    if (trains.length === 0) {
+        return md + "No trains were returned for this route.\n";
+    }
+
+    md += "| Train | Name | Type | Departure | Arrival | Duration | Distance (km) | Running days |\n";
+    md += "|---|---|---|---|---|---|---|---|\n";
+
+    trains.forEach(train => {
+        md += `| ${escapeCell(train.number)} | ${escapeCell(train.name)} | ${escapeCell(train.type)} | ` +
+              `${escapeCell(train.departure)} | ${escapeCell(train.arrival)} | ${escapeCell(train.duration)} | ` +
+              `${escapeCell(train.distance_km)} | ${escapeCell(train.running_days)} |\n`;
+    });
+
+    return md + "\n";
+}
+
+function formatHotels(rawHotels) {
+    if (isEmptyValue(rawHotels)) return "";
+
+    const raw = typeof rawHotels === "string" ? rawHotels : JSON.stringify(rawHotels, null, 2);
+
+    // Try to render Tavily-style JSON nicely
+    try {
+        const parsed = JSON.parse(raw);
+        const list = Array.isArray(parsed) ? parsed : parsed.results;
+
+        if (Array.isArray(list) && list.length > 0) {
+            let md = "## Hotels\n\n";
+
+            list.slice(0, 8).forEach(item => {
+                if (!item || typeof item !== "object") return;
+
+                const title = item.title || item.name || "Hotel result";
+                const snippet = String(item.content || item.snippet || item.description || "")
+                    .replace(/\s+/g, " ")
+                    .trim()
+                    .slice(0, 300);
+
+                md += item.url ? `- **[${title}](${item.url})**` : `- **${title}**`;
+                if (snippet) md += `\n  ${snippet}`;
+                md += "\n";
+            });
+
+            return md + "\n";
+        }
+    } catch (e) {
+        // not JSON - fall through
+    }
+
+    // Plain text / unknown structure: keep everything, collapsed
+    return `## Hotels\n\n<details><summary>View hotel search results</summary>\n\n\`\`\`\n${raw}\n\`\`\`\n\n</details>\n\n`;
+}
+
+function formatPlainSection(title, content) {
+    if (isEmptyValue(content)) return "";
+    const text = typeof content === "string" ? content : JSON.stringify(content, null, 2);
+    return `## ${title}\n\n${text.trim()}\n\n`;
+}
+
+function buildDisplayMarkdown(data) {
+    return typeof data.answer === "string"
+        ? data.answer
+        : String(data.answer ?? "");
+}
+
+/* ---------- Status widgets ---------- */
 
 function showAgentStatus(selectedAgents = []) {
     const agentStatus = document.getElementById("agentStatus");
@@ -54,6 +169,7 @@ function showAgentStatus(selectedAgents = []) {
 
     const agentLabels = {
         flight_agent: "✈ Flights",
+        train_agent: "🚆 Trains",
         hotel_agent: "⌂ Hotels",
         weather_agent: "☁ Weather",
         budget_agent: "₹ Budget",
@@ -87,7 +203,10 @@ function showTripConstraints(constraints = {}) {
         ["destination", "Destination"],
         ["origin", "Origin"],
         ["duration", "Duration"],
+        ["travel_date", "Travel Date"],
         ["budget", "Budget"],
+        ["num_travelers", "Travelers"],
+        ["transportation_preference", "Transport"],
         ["travel_style", "Travel Style"]
     ];
 
@@ -178,20 +297,21 @@ function updateApprovalStatus(approved) {
 }
 
 function showResult(data) {
-    latestAnswerMarkdown = data.answer || "";
+    const displayMarkdown = buildDisplayMarkdown(data);
+    latestAnswerMarkdown = displayMarkdown;
 
     const resultSection = document.getElementById("resultSection");
     const resultBox = document.getElementById("resultBox");
     const threadInfo = document.getElementById("threadInfo");
 
-    renderMarkdown(resultBox, data.answer || "");
+    renderMarkdown(resultBox, displayMarkdown);
 
     if (threadInfo) {
         threadInfo.textContent = `Thread ID: ${data.thread_id}`;
     }
 
     showAgentStatus(data.selected_agents || []);
-    showTripConstraints(data.trip_constraints || []);
+    showTripConstraints(data.trip_constraints || {});
 
     if (data.requires_approval) {
         showApprovalPanel(data);

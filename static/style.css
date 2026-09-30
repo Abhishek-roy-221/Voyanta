@@ -1252,3 +1252,25 @@ footer {
     .approval-actions { flex-direction:column; }
     .approval-actions button { width:100%; }
 }
+
+
+.result-box table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 12px 0 20px;
+    font-size: 0.92rem;
+    display: block;
+    overflow-x: auto;
+}
+.result-box th,
+.result-box td {
+    border: 1px solid #e2e8f0;
+    padding: 8px 12px;
+    text-align: left;
+    vertical-align: top;
+}
+.result-box th {
+    background: #f1f5f9;
+    font-weight: 700;
+    white-space: nowrap;
+}

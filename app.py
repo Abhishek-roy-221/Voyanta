@@ -10,10 +10,6 @@ from pydantic import BaseModel, Field
 
 from backend import run_travel_agent, resume_travel_agent
 
-import nest_asyncio
-
-nest_asyncio.apply()
-
 BASE_DIR = Path(__file__).resolve().parent
 
 app = FastAPI(
@@ -55,7 +51,7 @@ async def home(request: Request):
 
 
 @app.post("/api/travel")
-async def travel_planner(request_data: TravelRequest):
+def travel_planner(request_data: TravelRequest):
     try:
         user_message = request_data.message.strip()
 
@@ -68,7 +64,7 @@ async def travel_planner(request_data: TravelRequest):
                 },
             )
 
-        result =  run_travel_agent(
+        result = run_travel_agent(
             user_message,
             request_data.thread_id,
         )
@@ -81,7 +77,7 @@ async def travel_planner(request_data: TravelRequest):
         )
 
     except Exception as exc:
-        print("ERROR:", exc)
+        print("ERROR:", exc, flush=True)
         traceback.print_exc()
 
         return JSONResponse(
@@ -94,12 +90,9 @@ async def travel_planner(request_data: TravelRequest):
 
 
 @app.post("/api/travel/resume")
-async def resume_travel_plan(request_data: ApprovalRequest):
+def resume_travel_plan(request_data: ApprovalRequest):
     try:
-        if (
-            not request_data.approved
-            and not request_data.feedback.strip()
-        ):
+        if not request_data.approved and not request_data.feedback.strip():
             return JSONResponse(
                 status_code=400,
                 content={
@@ -111,7 +104,7 @@ async def resume_travel_plan(request_data: ApprovalRequest):
                 },
             )
 
-        result =  resume_travel_agent(
+        result = resume_travel_agent(
             thread_id=request_data.thread_id,
             approved=request_data.approved,
             feedback=request_data.feedback,
@@ -125,7 +118,7 @@ async def resume_travel_plan(request_data: ApprovalRequest):
         )
 
     except Exception as exc:
-        print("RESUME ERROR:", exc)
+        print("RESUME ERROR:", exc, flush=True)
         traceback.print_exc()
 
         return JSONResponse(
@@ -146,12 +139,18 @@ async def health_check():
             "supervisor_agent",
             "input_guardrail",
             "human_in_the_loop",
+            "train_agent",
+            "flight_agent",
+            "hotel_agent",
+            "weather_agent",
+            "budget_agent",
+            "itinerary_agent",
         ],
     }
 
 
 @app.get("/favicon.ico")
-async def favicon():
+def favicon():
     return JSONResponse(content={})
 
 
