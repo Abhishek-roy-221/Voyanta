@@ -1076,7 +1076,7 @@ RailRadar data (the ONLY source of truth):
 Extract the trains from the RailRadar data into the schema.
 
 Rules:
-- Include at most 8 trains.
+- Include at most 5 trains.
 - Use ONLY information present in the RailRadar data.
 - Copy train number, name, type, departure, arrival, duration, distance and
   running days exactly as provided. If a field is missing, leave it empty.
@@ -1113,8 +1113,34 @@ Rules:
         }
 
 
+def _tavily_results(raw: Any) -> list[dict[str, str]]:
+    """Parse a Tavily response into [{title, url, content}] (empty list if unparseable)."""
+    data = _maybe_json(_data_to_text(raw))
+    results = data.get("results") if isinstance(data, dict) else None
+    out = []
+    for r in results or []:
+        if isinstance(r, dict) and r.get("content"):
+            out.append({
+                "title": str(r.get("title", "")),
+                "url": str(r.get("url", "")),
+                "content": " ".join(str(r["content"]).split())[:1500],
+            })
+    return out
+
+
+def _hotel_sources_markdown(sources: list[dict[str, str]]) -> str:
+    rows = [
+        [s["title"][:60], s["content"][:180] + "…", f"[Open]({s['url']})" if s["url"] else "-"]
+        for s in sources[:6]
+    ]
+    return (
+        "_Hotel details could not be extracted automatically. Showing the best sources instead._\n\n"
+        + _md_table(["Source", "Snippet", "Link"], rows)
+    )
+
+
 HOTEL_EXTRACT_PROMPT = """
-Extract hotel details from the web search results below.
+Extract hotel details from the search results below.
 
 Trip constraints:
 {constraints}
@@ -1123,86 +1149,76 @@ Search results (the ONLY source of truth):
 {raw_text}
 
 Rules:
-- Return up to 10 real hotels/properties whose names appear in the text.
+- Return up to 8 real hotels/properties whose names appear in the text. Hotel names may
+  appear inside listing snippets (e.g. "Stay at The Soniotel from $29/night").
   Do NOT return listing-page titles such as "10 BEST Hotels in ..." as hotels.
-- Prefer a spread of budget, mid-range and premium options when the text allows it.
+- Prefer budget and mid-range hotels. When prices are available, order cheapest first.
 - price_per_night: copy exactly as written, including the currency symbol
-  (e.g. "₹2,499" or "from ₪21"). Do NOT convert currencies and do NOT estimate.
+  (e.g. "₹2,499" or "$29"). Do NOT convert currencies and do NOT estimate.
   Leave empty if no price is stated for that hotel.
 - rating, area, category and highlights: copy only what the text states; otherwise leave empty.
-- source_url / source_title: the page the hotel information came from (URLs appear in the text).
-- price_note: one short line if the prices are in mixed currencies or only "starting from" prices.
+- source_url / source_title: the SOURCE and URL lines of the block the hotel came from.
+- price_note: one short line if prices are in mixed currencies or "starting from" prices.
 - Never invent hotels, prices, ratings or links.
 """
 
 
 def hotel_agent(state: TravelState):
     constraints = state.get("trip_constraints", {})
-    hotel_destination = constraints.get("destination")
+    dest = constraints.get("destination")
 
-    if hotel_destination:
+    if dest:
         queries = [
-            f"best hotels in {hotel_destination} price per night in INR ₹ rating",
-            f"budget and mid-range hotels in {hotel_destination} price per night ₹",
+            f"best budget hotels in {dest} price per night ₹",
+            f"top rated affordable hotels in {dest} with rating and price per night",
+            f"{dest} hotels per night INR booking",
         ]
     else:
-        queries = [f"Best hotels for {state['user_query']}"]
+        queries = [f"Best budget hotels for {state['user_query']}"]
 
-    raw_chunks: list[str] = []
-    for search_query in queries:
+    sources: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for q in queries:
         try:
-            raw_chunks.append(
-                _data_to_text(asyncio.run(tavily_mcp_search(search_query)))
-            )
+            for s in _tavily_results(asyncio.run(tavily_mcp_search(q))):
+                if s["url"] not in seen:
+                    seen.add(s["url"])
+                    sources.append(s)
         except Exception as exc:
-            print(
-                f"HOTEL AGENT MCP ERROR: "
-                f"{type(exc).__name__}: {exc}",
-                flush=True,
-            )
+            print(f"HOTEL AGENT MCP ERROR: {type(exc).__name__}: {exc}", flush=True)
 
     llm_calls = state.get("llm_calls", 0)
 
-    if not raw_chunks:
+    if not sources:
         hotel_results = (
             "Live hotel search is temporarily unavailable, so no hotel "
             "names, prices or ratings could be retrieved."
         )
     else:
-        raw_text = "\n\n".join(raw_chunks)
+        raw_text = "\n\n".join(
+            f"SOURCE: {s['title']}\nURL: {s['url']}\n{s['content']}" for s in sources
+        )
         try:
             summary = _llm_structured(
                 "You extract hotel facts from search results and never invent data.",
-                HOTEL_EXTRACT_PROMPT.format(
-                    constraints=constraints,
-                    raw_text=raw_text[:24000],
-                ),
+                HOTEL_EXTRACT_PROMPT.format(constraints=constraints, raw_text=raw_text[:24000]),
                 HotelSummary,
             )
-            hotels = [h.model_dump() for h in summary.hotels]
             llm_calls += 1
-
-            if hotels:
-                hotel_results = json.dumps(
-                    {"hotels": hotels, "price_note": summary.price_note},
-                    ensure_ascii=False,
-                )
-            else:
-                hotel_results = raw_text[:6000]
+            hotels = [h.model_dump() for h in summary.hotels]
+            hotel_results = (
+                json.dumps({"hotels": hotels, "price_note": summary.price_note}, ensure_ascii=False)
+                if hotels else _hotel_sources_markdown(sources)
+            )
         except Exception as exc:
             print(f"HOTEL EXTRACTION ERROR: {type(exc).__name__}: {exc}", flush=True)
-            hotel_results = raw_text[:6000]
+            hotel_results = _hotel_sources_markdown(sources)
 
     return {
         "hotel_results": hotel_results,
-        "messages": [
-            AIMessage(
-                content="Hotel information processed."
-            )
-        ],
+        "messages": [AIMessage(content="Hotel information processed.")],
         "llm_calls": llm_calls,
     }
-
 
 
 
