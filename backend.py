@@ -8,6 +8,7 @@ import operator
 import uuid
 import asyncio
 import json
+import requests
 
 import psycopg
 from psycopg.rows import dict_row
@@ -165,6 +166,18 @@ class TripConstraints(BaseModel):
         description="Other explicit preferences or constraints stated by the user. Use an empty list when none are stated.",
     )
 
+class AirportCandidate(BaseModel):
+    city: str = Field(description="City or area the airport serves.")
+    iata: str = Field(description="3-letter IATA airport code, e.g. CCU.")
+
+
+class AirportSelection(BaseModel): 
+    origin_airports: list[AirportCandidate] = Field(
+description="Up to 2 main commercial airports serving the origin. Empty list if unknown."
+)
+    destination_airports: list[AirportCandidate] = Field(
+        description="Up to 2 main commercial airports serving the destination. Empty list if unknown."
+    )
 
 class SupervisorDecision(BaseModel):
     selected_agents: list[str] = Field(
@@ -851,85 +864,156 @@ Output Markdown with these parts (omit a part if there is nothing to say):
 
 # Flight Agent
 
-def flight_agent(state: TravelState):
-    print("\nINSIDE FLIGHT AGENT\n")
-    query = state["user_query"]
-    constraints = state.get("trip_constraints", {})
+AVIATIONSTACK_KEY_ENV = "AVIATIONSTACK_API_KEY"
+
+def _aviationstack_flights(dep_iata: str, arr_iata: str, limit: int = 100) -> list[dict]:
+    key = os.getenv(AVIATIONSTACK_KEY_ENV)
+    if not key:
+        raise ValueError(f"{AVIATIONSTACK_KEY_ENV} is missing from the environment.")
+
+    resp = requests.get(
+        "http://api.aviationstack.com/v1/flights",  # http on purpose: free plans don't support https
+        params={"access_key": key, "dep_iata": dep_iata, "arr_iata": arr_iata, "limit": limit},
+        timeout=20,
+    )
+    data = resp.json()
+    if isinstance(data, dict) and data.get("error"):
+        err = data["error"]
+        raise RuntimeError(err.get("message") or str(err))
+    return data.get("data") or []
+
+
+def _hhmm(ts: Any) -> str:
+    # AviationStack gives local airport time, so just show the clock part.
+    return str(ts)[11:16] if ts else "-"
+
+
+def _flights_markdown(flights: list[dict], max_rows: int = 5) -> str:
+    unique: dict[str, dict] = {}
+    for f in flights:
+        flight = f.get("flight") or {}
+        num = flight.get("iata")
+        if not num or flight.get("codeshared"):
+            continue  # skip codeshare duplicates
+        unique.setdefault(num, f)
+
+    rows = []
+    for num, f in sorted(unique.items(), key=lambda kv: _hhmm((kv[1].get("departure") or {}).get("scheduled"))):
+        dep, arr = f.get("departure") or {}, f.get("arrival") or {}
+        rows.append([
+            num,
+            (f.get("airline") or {}).get("name"),
+            f"{dep.get('iata', '')} {_hhmm(dep.get('scheduled'))}",
+            f"{arr.get('iata', '')} {_hhmm(arr.get('scheduled'))}",
+        ])
+
+    # Spread the picks across the day instead of taking the first 5 (all early-morning)
+    if len(rows) > max_rows:
+        step = (len(rows) - 1) / (max_rows - 1)
+        rows = [rows[round(i * step)] for i in range(max_rows)]
+
+    return _md_table(["Flight", "Airline", "Departs (local)", "Arrives (local)"], rows) if rows else ""
+
+
+def _flight_web_fallback(state: TravelState, reason: str) -> dict:
+    c = state.get("trip_constraints", {})
+    origin, dest = c.get("origin", ""), c.get("destination", "")
+    query = (
+        f"flights from {origin} to {dest} airlines direct flight duration"
+        if origin and dest else f"flights {state['user_query']}"
+    )
 
     try:
-        airports_text = ""
-        airlines_text = ""
-        airport_error = ""
-        airline_error = ""
-
-        try:
-            airports = asyncio.run(aviation_mcp_call("list_airports"))
-            airports_text = _data_to_text(airports)
-            if _looks_like_api_error(airports_text):
-                airport_error = _short_api_error(airports_text)
-        except Exception as exc:
-            airport_error = f"{type(exc).__name__}: {exc}"
-
-        try:
-            airlines = asyncio.run(aviation_mcp_call("list_airlines"))
-            airlines_text = _data_to_text(airlines)
-            if _looks_like_api_error(airlines_text):
-                airline_error = _short_api_error(airlines_text)
-        except Exception as exc:
-            airline_error = f"{type(exc).__name__}: {exc}"
-
-        print("\nAIRPORTS:", airports_text[:500])
-        print("\nAIRLINES:", airlines_text[:500])
-
-        if airport_error and airline_error:
-            # Nothing verified is available - do NOT call the LLM, do NOT invent anything.
-            reason = airport_error if airport_error == airline_error else f"{airport_error} / {airline_error}"
-            flight_data = (
-                "Flight data unavailable: the flight data source (AviationStack) "
-                f"rejected the request ({reason}). "
-                "No flight numbers, airlines, schedules or fares are shown because "
-                "they could not be verified."
-            )
-            return {
-                "flight_results": flight_data,
-                "messages": [AIMessage(content="Flight data source unavailable")],
-            }
-
-        prompt = FLIGHT_AGENT_PROMPT.format(
-            query=query,
-            constraints=constraints,
-            airport_status=(
-                f"UNAVAILABLE ({airport_error})" if airport_error else "OK"
-            ),
-            airport_data=(
-                "None" if airport_error else airports_text[:3000]
-            ),
-            airline_status=(
-                f"UNAVAILABLE ({airline_error})" if airline_error else "OK"
-            ),
-            airline_data=(
-                "None" if airline_error else airlines_text[:3000]
-            ),
-        )
-
-        response = llm.invoke(
-            [
-                SystemMessage(
-                    content=(
-                        "You are a careful flight research agent. "
-                        "You never invent flight data."
-                    )
-                ),
-                HumanMessage(content=prompt),
-            ]
-        )
-        flight_data = _content_to_text(response.content)
+        sources = _tavily_results(asyncio.run(tavily_mcp_search(query)))
     except Exception as exc:
-        flight_data = f"Flight information unavailable: {exc}"
+        print(f"FLIGHT FALLBACK ERROR: {type(exc).__name__}: {exc}", flush=True)
+        sources = []
+
+    if not sources:
+        return {
+            "flight_results": (
+                "Flight data unavailable: the flight data source rejected the request "
+                f"({reason}) and the web search fallback returned nothing. "
+                "No flight details are shown because they could not be verified."
+            ),
+            "messages": [AIMessage(content="Flight data unavailable")],
+        }
+
+    raw_text = "\n\n".join(
+        f"SOURCE: {s['title']}\nURL: {s['url']}\n{s['content']}" for s in sources[:6]
+    )
+    text = _llm_text(
+        "You summarise flight information from web search results and never invent data.",
+        f"""
+Trip constraints:
+{c}
+
+Search results (the ONLY source of truth):
+{raw_text[:12000]}
+
+Summarise in Markdown:
+- Airlines that appear to operate this route and the airports commonly used, ONLY if stated in the text.
+- Typical flight duration, ONLY if stated.
+- Any fares, copied exactly as written with currency. Do not convert or estimate.
+- Add a source link for each fact.
+
+Rules:
+- Never invent flight numbers, schedules, or prices.
+- If the text doesn't cover something, omit it.
+""",
+    )
+    note = (
+        "> Live flight data is unavailable (AviationStack plan restriction). "
+        "The details below come from web search results, not live schedules. "
+        "Confirm on the airline or booking site.\n\n"
+    )
+    return {
+        "flight_results": note + text,
+        "messages": [AIMessage(content="Flight info from web search fallback")],
+        "llm_calls": state.get("llm_calls", 0) + 1,
+    }
+
+
+
+def flight_agent(state: TravelState):
+    print("\nINSIDE FLIGHT AGENT\n")
+    constraints = state.get("trip_constraints", {})
+    origin = constraints.get("origin")
+    destination = constraints.get("destination")
+
+    if not origin or not destination:
+        return _flight_web_fallback(state, "origin or destination missing")
+
+    try:
+        selection = _llm_structured(
+            "You map cities to their main commercial airports. Use only real IATA codes.",
+            f"Origin: {origin}\nDestination: {destination}\n"
+            "Return up to 2 main commercial airports for each. Leave a list empty if unsure.",
+            AirportSelection,
+        )
+
+        all_flights: list[dict] = []
+        for o in selection.origin_airports[:2]:
+            for d in selection.destination_airports[:2]:
+                if o.iata and d.iata:
+                    all_flights.extend(_aviationstack_flights(o.iata.upper(), d.iata.upper()))
+
+        table = _flights_markdown(all_flights)
+        if not table:
+            return _flight_web_fallback(state, "no direct flights found on AviationStack for this route")
+
+        flight_data = (
+            f"**Direct flights on this route** · Source: AviationStack\n\n{table}\n\n"
+            "_Based on recently operated and scheduled flights, so times can shift by day. "
+            "No fares are included. Confirm schedules and prices on the airline or booking site._"
+        )
+    except Exception as exc:
+        print(f"FLIGHT AGENT ERROR: {type(exc).__name__}: {exc}", flush=True)
+        return _flight_web_fallback(state, f"{type(exc).__name__}: {exc}")
 
     return {
         "flight_results": flight_data,
-        "messages": [AIMessage(content="Flight recommendations generated")],
+        "messages": [AIMessage(content="Flight information verified.")],
         "llm_calls": state.get("llm_calls", 0) + 1,
     }
 
